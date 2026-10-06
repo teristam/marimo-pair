@@ -1,8 +1,12 @@
 import ast
 import json
+import os
+import pickle
 import platform
 import sys
 import tempfile
+import textwrap
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +26,9 @@ from branch_state import (
     export_named_values,
     read_batch,
     read_parent_runtime,
+    resolve_dotenv_paths,
     validate_names,
+    verify_runtime_environment,
     write_batch,
 )
 
@@ -32,6 +38,24 @@ try:
 except Exception:
     _script_metadata = None
 MARIMO_AVAILABLE = _script_metadata is not None
+
+
+def _hidden_notebook_function():
+    return None
+
+
+class ReduceHidingNotebookFunction:
+    def __reduce__(self):
+        return list, ([_hidden_notebook_function],)
+
+
+class OmitsLockWhenPickled:
+    def __init__(self):
+        self.value = 7
+        self.lock = threading.Lock()
+
+    def __getstate__(self):
+        return {"value": self.value}
 
 
 class NameValidationTests(unittest.TestCase):
@@ -77,6 +101,49 @@ class BatchSerializationTests(unittest.TestCase):
             self.assertIn("NotebookOnly", str(caught.exception))
             self.assertFalse(path.exists())
 
+    def test_reduce_output_cannot_hide_a_notebook_function(self):
+        function = _hidden_notebook_function
+        function.__module__ = "__main__"
+        setattr(sys.modules["__main__"], function.__name__, function)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "batch.pickle"
+                with self.assertRaises(BranchStateError) as caught:
+                    write_batch({"reduced": ReduceHidingNotebookFunction()}, path)
+                self.assertIn("reduced", str(caught.exception))
+                self.assertIn("__main__", str(caught.exception))
+                self.assertFalse(path.exists())
+        finally:
+            delattr(sys.modules["__main__"], function.__name__)
+            function.__module__ = __name__
+
+    def test_getstate_can_omit_an_untransferable_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "batch.pickle"
+            write_batch({"snapshot": OmitsLockWhenPickled()}, path)
+            restored = read_batch(path)["snapshot"]
+        self.assertEqual(restored.value, 7)
+        self.assertFalse(hasattr(restored, "lock"))
+
+    def test_unpickler_rejects_main_globals_and_deletes_batch(self):
+        notebook_type = type("NotebookOnly", (), {"__module__": "__main__"})
+        setattr(sys.modules["__main__"], "NotebookOnly", notebook_type)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "batch.pickle"
+                with path.open("wb") as stream:
+                    pickler = pickle.Pickler(stream)
+                    pickler.dump("danger")
+                    pickler.dump("__main__.NotebookOnly")
+                    pickler.dump(notebook_type())
+                with self.assertRaises(BranchStateError) as caught:
+                    read_batch(path)
+                self.assertIn("danger", str(caught.exception))
+                self.assertIn("__main__.NotebookOnly", str(caught.exception))
+                self.assertFalse(path.exists())
+        finally:
+            delattr(sys.modules["__main__"], "NotebookOnly")
+
     def test_nested_ui_and_runtime_state_errors_are_attributable(self):
         ui_type = type("Text", (), {"__module__": "marimo._plugins.ui"})
         state_type = type("State", (), {"__module__": "marimo._runtime.state"})
@@ -119,7 +186,6 @@ class RuntimeCaptureTests(unittest.TestCase):
         notebook: Path,
         root: Path,
         config: dict,
-        script_runtime: dict | None = None,
         project_path: Path | None = None,
     ):
         bundle = root / "batch.pickle"
@@ -136,10 +202,7 @@ class RuntimeCaptureTests(unittest.TestCase):
         if MARIMO_AVAILABLE:
             export_named_values({}, [], bundle, metadata, notebook)
         else:
-            with (
-                mock.patch.object(branch_state, "_load_parent_config", return_value=(manager, config)),
-                mock.patch.object(branch_state, "_script_runtime", return_value=script_runtime or {}),
-            ):
+            with mock.patch.object(branch_state, "_load_parent_config", return_value=(manager, config)):
                 export_named_values({}, [], bundle, metadata, notebook)
         runtime = read_parent_runtime(metadata)
         return runtime, metadata
@@ -170,6 +233,41 @@ class RuntimeCaptureTests(unittest.TestCase):
             self.assertIn(str(project / "pyproject.toml"), runtime.config_sources.values())
             self.assertNotIn("super-secret-value", metadata.read_text(encoding="utf-8"))
 
+    def test_missing_default_dotenv_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            notebook = root / "parent.py"
+            notebook.write_text("", encoding="utf-8")
+            missing = root / ".env"
+            runtime, _ = self._export_runtime(
+                notebook, root, {"runtime": {"dotenv": [str(missing)]}}
+            )
+        self.assertEqual(runtime.dotenv, (str(missing),))
+        self.assertFalse(missing.exists())
+
+    @unittest.skipUnless(MARIMO_AVAILABLE, "marimo is not importable in this Python environment")
+    def test_relative_dotenv_uses_marimos_project_root_resolver(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "project"
+            notebook_dir = project / "notebooks"
+            notebook_dir.mkdir(parents=True)
+            (project / "pyproject.toml").write_text("[tool.marimo]\n", encoding="utf-8")
+            notebook = notebook_dir / "parent.py"
+            notebook.write_text("", encoding="utf-8")
+            self.assertEqual(
+                resolve_dotenv_paths([".private.env"], notebook),
+                (str((project / ".private.env").absolute()),),
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            notebook_dir = Path(directory) / "notebooks"
+            notebook_dir.mkdir()
+            notebook = notebook_dir / "parent.py"
+            notebook.write_text("", encoding="utf-8")
+            self.assertEqual(
+                resolve_dotenv_paths([".private.env"], notebook),
+                (str((notebook_dir / ".private.env").absolute()),),
+            )
+
     def test_no_project_uses_notebook_adjacent_dotenv_default(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -182,17 +280,18 @@ class RuntimeCaptureTests(unittest.TestCase):
             )
             self.assertEqual(runtime.dotenv, (str(dotenv.resolve()),))
 
-    def test_script_paths_override_project_and_resolve_from_notebook(self):
+    def test_script_paths_override_project_and_resolve_dotenv_from_project_root(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project = root / "project"
             notebook_dir = project / "notebooks"
-            script_src = notebook_dir / "script-src"
+            script_src = project / "script-src"
             project_src = project / "project-src"
+            notebook_dir.mkdir(parents=True)
             script_src.mkdir(parents=True)
             project_src.mkdir(parents=True)
             (project / ".project.env").write_text("PROJECT_KEY=x\n", encoding="utf-8")
-            (notebook_dir / ".script.env").write_text("SCRIPT_KEY=x\n", encoding="utf-8")
+            (project / ".script.env").write_text("SCRIPT_KEY=x\n", encoding="utf-8")
             (project / "pyproject.toml").write_text(
                 '[tool.marimo.runtime]\npythonpath = ["project-src"]\ndotenv = [".project.env"]\n',
                 encoding="utf-8",
@@ -212,34 +311,148 @@ class RuntimeCaptureTests(unittest.TestCase):
                     root,
                     {
                         "runtime": {
-                            "pythonpath": ["script-src"],
-                            "dotenv": [str((project / ".project.env").resolve())],
+                            "pythonpath": [str(script_src)],
+                            "dotenv": [str((project / ".script.env").resolve())],
                         }
-                    },
-                    script_runtime={
-                        "pythonpath": ["script-src"],
-                        "dotenv": [".script.env"],
                     },
                     project_path=project,
                 )
-            self.assertEqual(runtime.pythonpath, (str(script_src.resolve()),))
-            self.assertEqual(runtime.dotenv, (str((notebook_dir / ".script.env").resolve()),))
+            self.assertIn(str(script_src.resolve()), runtime.pythonpath)
+            self.assertNotIn(str(project_src.resolve()), runtime.pythonpath)
+            self.assertEqual(runtime.dotenv, (str((project / ".script.env").resolve()),))
 
-    def test_read_runtime_rejects_inaccessible_required_path(self):
+    def test_existing_unreadable_or_nonregular_dotenv_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             notebook = root / "parent.py"
             notebook.write_text("", encoding="utf-8")
-            (root / ".env").write_text("PAIR_TEST_KEY=harmless\n", encoding="utf-8")
+            dotenv = root / ".env"
+            dotenv.write_text("PAIR_TEST_KEY=harmless\n", encoding="utf-8")
             _, metadata = self._export_runtime(notebook, root, {"runtime": {}})
             data = json.loads(metadata.read_text(encoding="utf-8"))
-            data["dotenv"] = [str(root / "missing.env")]
+            data["dotenv"] = [str(dotenv)]
+            metadata.write_text(json.dumps(data), encoding="utf-8")
+            real_access = branch_state.os.access
+
+            def deny_dotenv(path, mode):
+                if os.fspath(path) == str(dotenv):
+                    return False
+                return real_access(path, mode)
+
+            with mock.patch.object(branch_state.os, "access", side_effect=deny_dotenv):
+                with self.assertRaises(BranchStateError):
+                    read_parent_runtime(metadata)
+            data["dotenv"] = [str(root)]
             metadata.write_text(json.dumps(data), encoding="utf-8")
             with self.assertRaises(BranchStateError):
                 read_parent_runtime(metadata)
 
+    def test_controller_can_read_metadata_for_a_different_interpreter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            notebook = root / "parent.py"
+            notebook.write_text("", encoding="utf-8")
+            parent_only = root / "parent-only-import-root"
+            parent_only.mkdir()
+            with mock.patch.object(sys, "path", [*sys.path, str(parent_only)]):
+                _, metadata = self._export_runtime(notebook, root, {"runtime": {}})
+            other_python = root / "controller-python"
+            other_python.write_text("not the parent interpreter", encoding="utf-8")
+            with (
+                mock.patch.object(branch_state.sys, "executable", str(other_python)),
+                mock.patch.object(branch_state.sys, "path", []),
+            ):
+                runtime = read_parent_runtime(metadata)
+                self.assertIn(str(parent_only), runtime.pythonpath)
+                with self.assertRaises(BranchStateError):
+                    verify_runtime_environment(runtime)
+
 
 class CodeGenerationTests(unittest.TestCase):
+    def _write_helper(self, root: Path) -> Path:
+        helper = root / "helper.py"
+        helper.write_text(
+            textwrap.dedent(
+                '''\
+                from __future__ import annotations
+                import json
+                import os
+                import sys
+                from dataclasses import dataclass
+                from pathlib import Path
+
+                @dataclass
+                class Runtime:
+                    cwd: str
+                    sys_path: list[str]
+                    verified: bool = False
+
+                _current_runtime = None
+
+                def export_named_values(scope, names, bundle_path, metadata_path, notebook_path):
+                    Path(bundle_path).write_text(json.dumps({name: scope[name] for name in names}))
+
+                def read_parent_runtime(metadata_path):
+                    global _current_runtime
+                    _current_runtime = Runtime(os.getcwd(), list(sys.path))
+                    return _current_runtime
+
+                def verify_runtime_environment(runtime):
+                    runtime.verified = True
+
+                def read_batch(bundle_path):
+                    if not _current_runtime or not _current_runtime.verified:
+                        raise RuntimeError("runtime verification did not run first")
+                    if os.getcwd() != _current_runtime.cwd or sys.path != _current_runtime.sys_path:
+                        raise RuntimeError("parent cwd/sys.path were not restored before unpickling")
+                    return json.loads(Path(bundle_path).read_text())
+                '''
+            ),
+            encoding="utf-8",
+        )
+        return helper
+
+    def _assert_helper_registered(self, namespace: dict):
+        helper_name = next(
+            value for key, value in namespace.items() if key.endswith("_helper_name")
+        )
+        helper_key = next(key for key in namespace if key.endswith("_helper"))
+        self.assertIs(sys.modules[helper_name], namespace[helper_key])
+        return helper_name
+
+    def test_generated_parent_and_worker_programs_execute_with_registered_helpers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = self._write_helper(root)
+            notebook = root / "parent.py"
+            notebook.write_text("", encoding="utf-8")
+            bundle = root / "batch.json"
+            metadata = root / "runtime.json"
+
+            parent_namespace = {"records": [1], "ignored": "not exported"}
+            previous_bytecode = sys.dont_write_bytecode
+            exec(
+                build_parent_export_code(["records"], bundle, metadata, helper, notebook),
+                parent_namespace,
+            )
+            self.assertEqual(json.loads(bundle.read_text()), {"records": [1]})
+            self.assertEqual(sys.dont_write_bytecode, previous_bytecode)
+            parent_module = self._assert_helper_registered(parent_namespace)
+            sys.modules.pop(parent_module)
+
+            bundle.write_text(json.dumps({"records": [2], "sample": "worker"}), encoding="utf-8")
+            worker_namespace = {}
+            previous_bytecode = sys.dont_write_bytecode
+            exec(
+                build_worker_bootstrap_cell(["records", "sample"], bundle, metadata, helper),
+                worker_namespace,
+            )
+            self.assertEqual(worker_namespace["records"], [2])
+            self.assertEqual(worker_namespace["sample"], "worker")
+            self.assertEqual(sys.dont_write_bytecode, previous_bytecode)
+            worker_module = self._assert_helper_registered(worker_namespace)
+            sys.modules.pop(worker_module)
+
     def test_worker_header_and_bootstrap_are_safe_and_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -15,7 +15,6 @@ import sys
 import threading
 import types
 import uuid
-from collections import deque
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
@@ -82,9 +81,7 @@ def _module_name(value: object) -> str:
     return type(value).__module__
 
 
-def _unsupported_kind(value: object) -> str | None:
-    module = _module_name(value)
-    name = getattr(value, "__name__", type(value).__name__)
+def _unsupported_global(module: str, name: str) -> str | None:
     if module == "__main__":
         return "notebook __main__ definitions cannot be restored in another kernel"
     if module.startswith("marimo._plugins.ui"):
@@ -94,6 +91,17 @@ def _unsupported_kind(value: object) -> str | None:
         and name in {"State", "RuntimeContext", "KernelRuntimeContext"}
     ):
         return "marimo state and runtime-context values cannot be transferred"
+    return None
+
+
+def _unsupported_kind(value: object) -> str | None:
+    module = _module_name(value)
+    name = value.__name__ if isinstance(
+        value, (types.FunctionType, types.BuiltinFunctionType, type)
+    ) else type(value).__name__
+    reason = _unsupported_global(module, name)
+    if reason:
+        return reason
     if isinstance(value, types.ModuleType):
         return "module objects are process-wide resources"
     if isinstance(value, io.IOBase):
@@ -110,62 +118,37 @@ def _unsupported_kind(value: object) -> str | None:
         return "active generators and coroutines cannot be transferred"
     if isinstance(value, memoryview):
         return "memory views over external buffers cannot be transferred"
-    lock_type = type(threading.Lock())
-    if isinstance(value, lock_type):
+    if isinstance(value, (type(threading.Lock()), type(threading.RLock()))):
         return "locks cannot be transferred"
     return None
 
 
-def _check_value_graph(name: str, value: object) -> None:
-    """Reject unsupported objects anywhere in a value's reachable state."""
-    seen: set[int] = set()
-    pending = [value]
-    while pending:
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        reason = _unsupported_kind(current)
+class _ValidatingPickler(pickle.Pickler):
+    def __init__(self, stream: Any) -> None:
+        super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
+        self.current_name = "<batch>"
+
+    def persistent_id(self, value: object) -> None:
+        reason = _unsupported_kind(value)
         if reason:
-            raise BranchStateError(name, _type_name(current), "export", reason)
+            raise BranchStateError(
+                self.current_name, _type_name(value), "export", reason
+            )
+        return None
 
-        if isinstance(current, Mapping):
-            pending.extend(current.keys())
-            pending.extend(current.values())
-        elif isinstance(current, (list, tuple, set, frozenset, deque)):
-            pending.extend(current)
 
-        if isinstance(current, types.FunctionType):
-            pending.extend(current.__defaults__ or ())
-            pending.extend((current.__kwdefaults__ or {}).values())
-            if current.__closure__:
-                for cell in current.__closure__:
-                    try:
-                        pending.append(cell.cell_contents)
-                    except ValueError:
-                        pass
-            continue
+class _GuardedUnpickler(pickle.Unpickler):
+    def __init__(self, stream: Any) -> None:
+        super().__init__(stream)
+        self.current_name = "<batch>"
 
-        if isinstance(current, (str, bytes, bytearray, int, float, complex, bool, type(None), type, Path)):
-            continue
-        try:
-            attributes = vars(current)
-        except TypeError:
-            attributes = {}
-        pending.extend(attributes.values())
-        for cls in type(current).__mro__:
-            slots = cls.__dict__.get("__slots__", ())
-            if isinstance(slots, str):
-                slots = (slots,)
-            for slot in slots:
-                if slot in {"__dict__", "__weakref__"}:
-                    continue
-                descriptor = cls.__dict__.get(slot)
-                if isinstance(descriptor, types.MemberDescriptorType):
-                    try:
-                        pending.append(descriptor.__get__(current, type(current)))
-                    except AttributeError:
-                        pass
+    def find_class(self, module: str, name: str) -> object:
+        reason = _unsupported_global(module, name)
+        if reason:
+            raise BranchStateError(
+                self.current_name, f"{module}.{name}", "restore", reason
+            )
+        return super().find_class(module, name)
 
 
 def _open_private(path: Path, mode: str, *, encoding: str | None = None):
@@ -189,15 +172,17 @@ def write_batch(values: Mapping[str, object], path: Path) -> None:
         stream = _open_private(Path(path), "wb")
         created = True
         with stream:
-            pickler = pickle.Pickler(stream, protocol=pickle.HIGHEST_PROTOCOL)
+            pickler = _ValidatingPickler(stream)
             for current_name in names:
                 current_value = values[current_name]
-                _check_value_graph(current_name, current_value)
+                pickler.current_name = current_name
                 type_name = _type_name(current_value)
                 try:
                     pickler.dump(current_name)
                     pickler.dump(type_name)
                     pickler.dump(current_value)
+                except BranchStateError:
+                    raise
                 except Exception as error:
                     raise BranchStateError(
                         current_name, type_name, "export", error
@@ -219,19 +204,28 @@ def write_batch(values: Mapping[str, object], path: Path) -> None:
                 pass
 
 
+def _delete_artifact(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def read_batch(path: Path) -> dict[str, object]:
-    """Restore a shared-memo stream, identifying the record that failed."""
+    """Restore a shared-memo stream with guarded globals and record attribution."""
+    artifact = Path(path)
     values: dict[str, object] = {}
     current_name = "<batch>"
     type_name = "unknown"
     try:
-        with Path(path).open("rb") as stream:
-            unpickler = pickle.Unpickler(stream)
+        with artifact.open("rb") as stream:
+            unpickler = _GuardedUnpickler(stream)
             while True:
                 try:
                     current_name = unpickler.load()
                 except EOFError:
                     return values
+                unpickler.current_name = str(current_name)
                 try:
                     type_name = unpickler.load()
                     value = unpickler.load()
@@ -246,8 +240,10 @@ def read_batch(path: Path) -> dict[str, object]:
                 validate_names([current_name], values.keys())
                 values[current_name] = value
     except BranchStateError:
+        _delete_artifact(artifact)
         raise
     except Exception as error:
+        _delete_artifact(artifact)
         raise BranchStateError(
             str(current_name), str(type_name), "restore", error
         ) from error
@@ -277,11 +273,16 @@ def _check_import_path(path: str, name: str) -> None:
         raise BranchStateError(name, "path", "restore", f"required path is inaccessible: {path}")
 
 
-def _check_dotenv(path: str) -> None:
+def _check_dotenv(path: str, operation: str) -> None:
     candidate = Path(path)
+    if not candidate.exists():
+        return
     if not candidate.is_file() or not os.access(candidate, os.R_OK):
         raise BranchStateError(
-            "<runtime.dotenv>", "path", "capture", f"required dotenv file is inaccessible: {path}"
+            "<runtime.dotenv>",
+            "path",
+            operation,
+            f"existing dotenv path is not a readable regular file: {path}",
         )
 
 
@@ -313,53 +314,75 @@ def _config_sources(manager: object, notebook: Path) -> dict[str, str]:
     return sources
 
 
-def _script_runtime(notebook: Path) -> dict[str, Any]:
-    try:
-        from marimo._environments import script_metadata
+def resolve_dotenv_paths(
+    paths: Sequence[str], notebook_path: Path
+) -> tuple[str, ...]:
+    """Keep marimo-resolved paths and resolve remaining relative paths as marimo does."""
+    values = [str(path) for path in paths]
+    relative = [path for path in values if not _is_absolute_path(path)]
+    if not relative:
+        return tuple(
+            str(Path(path).absolute()) if Path(path).is_absolute() else path
+            for path in values
+        )
 
-        parsed = script_metadata.loads(notebook.read_text(encoding="utf-8")) or {}
-    except Exception as error:
-        raise BranchStateError(
-            "<runtime>", "script metadata", "capture", error
-        ) from error
-    return (
-        parsed.get("tool", {})
-        .get("marimo", {})
-        .get("runtime", {})
+    from marimo._config.manager import ProjectConfigManager
+
+    resolver = ProjectConfigManager(str(notebook_path))
+    resolved = resolver._resolve_dotenv({"runtime": {"dotenv": relative}})
+    resolved_relative = iter(resolved["runtime"]["dotenv"])
+    return tuple(
+        str(Path(path).absolute()) if Path(path).is_absolute() else next(resolved_relative)
+        for path in values
+    )
+
+
+def _resolve_pythonpath_paths(
+    paths: Sequence[str], notebook_path: Path
+) -> tuple[str, ...]:
+    values = [str(path) for path in paths]
+    relative = [path for path in values if not _is_absolute_path(path)]
+    if not relative:
+        return tuple(
+            str(Path(path).absolute()) if Path(path).is_absolute() else path
+            for path in values
+        )
+
+    from marimo._config.manager import ProjectConfigManager
+
+    resolver = ProjectConfigManager(str(notebook_path))
+    resolved = resolver._resolve_pythonpath({"runtime": {"pythonpath": relative}})
+    resolved_relative = iter(resolved["runtime"]["pythonpath"])
+    root = resolver._dotenv_root
+    return tuple(
+        str(Path(path).absolute()) if Path(path).is_absolute()
+        else str((root / next(resolved_relative)).absolute())
+        for path in values
     )
 
 
 def _runtime_paths(
-    manager_config: Mapping[str, Any], notebook: Path, script_runtime: Mapping[str, Any]
+    manager_config: Mapping[str, Any], notebook: Path
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     runtime = manager_config.get("runtime", {})
     if not isinstance(runtime, Mapping):
-        raise BranchStateError("<runtime>", _type_name(runtime), "capture", "runtime config is invalid")
-
-    # The merged project pythonpath has already been resolved by marimo against
-    # pyproject.toml; script-relative settings are instead notebook-relative.
-    if "pythonpath" in script_runtime:
-        pythonpath_values = script_runtime["pythonpath"]
-    else:
-        pythonpath_values = runtime.get("pythonpath", [])
+        raise BranchStateError(
+            "<runtime>", _type_name(runtime), "capture", "runtime config is invalid"
+        )
+    pythonpath_values = runtime.get("pythonpath", [])
+    dotenv_values = runtime.get("dotenv", [])
     if not isinstance(pythonpath_values, (list, tuple)):
         raise BranchStateError(
             "<runtime.pythonpath>", _type_name(pythonpath_values), "capture", "expected a path list"
         )
-    pythonpath = tuple(_absolute_path(str(path), notebook.parent) for path in pythonpath_values)
-
-    if "dotenv" in script_runtime:
-        dotenv_values = script_runtime["dotenv"]
-        dotenv_base = notebook.parent
-    else:
-        dotenv_values = runtime.get("dotenv", [])
-        dotenv_base = None
     if not isinstance(dotenv_values, (list, tuple)):
         raise BranchStateError(
             "<runtime.dotenv>", _type_name(dotenv_values), "capture", "expected a path list"
         )
-    dotenv = tuple(_absolute_path(str(path), dotenv_base) for path in dotenv_values)
-    return pythonpath, dotenv
+    return (
+        _resolve_pythonpath_paths(pythonpath_values, notebook),
+        resolve_dotenv_paths(dotenv_values, notebook),
+    )
 
 
 def _capture_parent_runtime(notebook_path: Path) -> dict[str, Any]:
@@ -370,8 +393,7 @@ def _capture_parent_runtime(notebook_path: Path) -> dict[str, Any]:
         )
     try:
         manager, config = _load_parent_config(notebook)
-        script_runtime = _script_runtime(notebook)
-        pythonpath, dotenv = _runtime_paths(config, notebook, script_runtime)
+        pythonpath, dotenv = _runtime_paths(config, notebook)
     except BranchStateError:
         raise
     except Exception as error:
@@ -388,7 +410,7 @@ def _capture_parent_runtime(notebook_path: Path) -> dict[str, Any]:
                 f"configured import root is not active in parent sys.path: {path}",
             )
     for path in dotenv:
-        _check_dotenv(path)
+        _check_dotenv(path, "capture")
 
     config_sources = _config_sources(manager, notebook)
     project_path = Path(config_sources["project"]) if "project" in config_sources else None
@@ -482,7 +504,7 @@ def export_named_values(
 
 
 def read_parent_runtime(metadata_path: Path) -> ParentRuntime:
-    """Load captured runtime context and reject paths this host cannot reproduce."""
+    """Load metadata and validate paths without requiring the controller's Python."""
     metadata = Path(metadata_path)
     if not metadata.is_absolute():
         raise BranchStateError("<runtime.metadata>", "path", "restore", "metadata path must be absolute")
@@ -507,38 +529,10 @@ def read_parent_runtime(metadata_path: Path) -> ParentRuntime:
         raise BranchStateError("<runtime.cwd>", "path", "restore", f"parent cwd is inaccessible: {cwd}")
     if not Path(notebook).is_absolute() or not Path(notebook).is_file() or not os.access(notebook, os.R_OK):
         raise BranchStateError("<runtime.notebook>", "path", "restore", f"parent notebook is inaccessible: {notebook}")
-    current_executable = Path(sys.executable)
-    captured_executable = Path(python_executable)
-    if not current_executable.is_file() or not captured_executable.is_file():
+    executable = Path(python_executable)
+    if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.R_OK | os.X_OK):
         raise BranchStateError(
-            "<runtime.python>", "executable", "restore", "parent Python executable is inaccessible"
-        )
-    try:
-        same_executable = os.path.samefile(current_executable, captured_executable)
-    except OSError:
-        same_executable = os.path.normcase(str(current_executable)) == os.path.normcase(str(captured_executable))
-    if not same_executable or platform.python_version() != python_version:
-        raise BranchStateError(
-            "<runtime.python>", "executable", "restore",
-            "parent Python executable/version cannot be reproduced by this controller",
-        )
-    if dependency_context.get("implementation") != platform.python_implementation():
-        raise BranchStateError(
-            "<runtime.python>", "interpreter", "restore", "Python implementation differs from parent"
-        )
-    if dependency_context.get("python_prefix") != sys.prefix or dependency_context.get("base_prefix") != sys.base_prefix:
-        raise BranchStateError(
-            "<runtime.dependencies>", "environment", "restore",
-            "parent Python dependency environment cannot be reproduced",
-        )
-    if (
-        sandbox_context.get("virtual_env") != os.environ.get("VIRTUAL_ENV")
-        or sandbox_context.get("conda_prefix") != os.environ.get("CONDA_PREFIX")
-        or sandbox_context.get("is_virtualenv") != (sys.prefix != sys.base_prefix)
-    ):
-        raise BranchStateError(
-            "<runtime.sandbox>", "environment", "restore",
-            "parent sandbox/dependency context cannot be reproduced",
+            "<runtime.python>", "executable", "restore", f"parent Python executable is inaccessible: {python_executable}"
         )
 
     for path in pythonpath:
@@ -548,25 +542,19 @@ def read_parent_runtime(metadata_path: Path) -> ParentRuntime:
     for path in dotenv:
         if not _is_absolute_path(path):
             raise BranchStateError("<runtime.dotenv>", "path", "restore", f"path is not absolute: {path}")
-        _check_dotenv(path)
+        _check_dotenv(path, "restore")
 
-    # Add roots present only in the parent kernel. The worker uses this field
-    # for its header; the bootstrap later restores the exact captured sys.path.
-    controller_paths = {_path_key(entry, cwd) for entry in sys.path}
-    configured_paths = {_path_key(entry, cwd) for entry in pythonpath}
+    # Include captured parent roots without comparing to the controller's sys.path.
+    configured = {_path_key(path, cwd) for path in pythonpath}
     additional: list[str] = []
     for entry in parent_sys_path:
-        if not entry:
-            candidate = cwd
-        else:
-            candidate = _absolute_path(entry, Path(cwd))
+        candidate = _absolute_path(entry, Path(cwd)) if entry else cwd
         key = _path_key(candidate, cwd)
-        if key in controller_paths or key in configured_paths:
+        if key in configured or not Path(candidate).exists():
             continue
         _check_import_path(candidate, "<runtime.sys_path>")
         additional.append(candidate)
-        configured_paths.add(key)
-    effective_pythonpath = tuple(dict.fromkeys((*pythonpath, *additional)))
+        configured.add(key)
     return ParentRuntime(
         notebook_path=notebook,
         config_sources=config_sources,
@@ -574,11 +562,34 @@ def read_parent_runtime(metadata_path: Path) -> ParentRuntime:
         sys_path=parent_sys_path,
         python_executable=python_executable,
         python_version=python_version,
-        pythonpath=effective_pythonpath,
+        pythonpath=tuple(dict.fromkeys((*pythonpath, *additional))),
         dotenv=dotenv,
         sandbox_context=sandbox_context,
         dependency_context=dependency_context,
     )
+
+
+def verify_runtime_environment(runtime: ParentRuntime) -> None:
+    """Verify that this worker runs the captured parent interpreter/environment."""
+    executable = Path(runtime.python_executable)
+    try:
+        same_executable = os.path.samefile(sys.executable, executable)
+    except OSError:
+        same_executable = os.path.normcase(os.path.abspath(sys.executable)) == os.path.normcase(str(executable))
+    dependencies = runtime.dependency_context
+    if (
+        not same_executable
+        or platform.python_version() != runtime.python_version
+        or platform.python_implementation() != dependencies.get("implementation")
+        or sys.prefix != dependencies.get("python_prefix")
+        or sys.base_prefix != dependencies.get("base_prefix")
+    ):
+        raise BranchStateError(
+            "<runtime.python>",
+            "interpreter",
+            "restore",
+            "worker interpreter/version/prefix differs from the parent",
+        )
 
 
 def _literal(value: str) -> str:
@@ -622,7 +633,12 @@ import sys as {prefix}_sys
 try:
     {prefix}_spec = {prefix}_importlib_util.spec_from_file_location({prefix}_helper_name, {_literal(str(helper_path))})
     {prefix}_helper = {prefix}_importlib_util.module_from_spec({prefix}_spec)
-    {prefix}_spec.loader.exec_module({prefix}_helper)
+    {prefix}_sys.modules[{prefix}_helper_name] = {prefix}_helper
+    try:
+        {prefix}_spec.loader.exec_module({prefix}_helper)
+    except BaseException:
+        {prefix}_sys.modules.pop({prefix}_helper_name, None)
+        raise
 finally:
     {prefix}_sys.dont_write_bytecode = {prefix}_dont_write
 {prefix}_helper.export_named_values(
@@ -692,10 +708,16 @@ try:
     {prefix}_helper_name = {_literal(prefix + '_helper')}
     {prefix}_spec = {prefix}_importlib_util.spec_from_file_location({prefix}_helper_name, {_literal(str(helper_path))})
     {prefix}_helper = {prefix}_importlib_util.module_from_spec({prefix}_spec)
-    {prefix}_spec.loader.exec_module({prefix}_helper)
+    {prefix}_sys.modules[{prefix}_helper_name] = {prefix}_helper
+    try:
+        {prefix}_spec.loader.exec_module({prefix}_helper)
+    except BaseException:
+        {prefix}_sys.modules.pop({prefix}_helper_name, None)
+        raise
 finally:
     {prefix}_sys.dont_write_bytecode = {prefix}_dont_write
 {prefix}_runtime = {prefix}_helper.read_parent_runtime({prefix}_pathlib.Path({_literal(str(metadata_path))}))
+{prefix}_helper.verify_runtime_environment({prefix}_runtime)
 {prefix}_os.chdir({prefix}_runtime.cwd)
 {prefix}_sys.path[:] = list({prefix}_runtime.sys_path)
 {prefix}_values = {prefix}_helper.read_batch({prefix}_pathlib.Path({_literal(str(bundle_path))}))
