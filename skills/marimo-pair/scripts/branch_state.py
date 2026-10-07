@@ -383,7 +383,7 @@ def _runtime_paths(
     # relative entry can come from user config, where marimo uses the parent
     # cwd; re-anchoring it to the notebook/project could select another file.
     relative_dotenv = [
-        str(path) for path in dotenv_values if not _is_absolute_path(str(path))
+        str(path) for path in dotenv_values if not Path(str(path)).is_absolute()
     ]
     if relative_dotenv:
         raise BranchStateError(

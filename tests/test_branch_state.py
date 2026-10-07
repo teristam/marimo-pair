@@ -8,7 +8,7 @@ import tempfile
 import textwrap
 import threading
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest import mock
 
@@ -241,6 +241,19 @@ class RuntimeCaptureTests(unittest.TestCase):
             with self.assertRaisesRegex(BranchStateError, "relative dotenv"):
                 branch_state._runtime_paths(
                     {"runtime": {"dotenv": [".user.env"]}}, notebook
+                )
+
+    def test_windows_style_path_is_relative_to_parent_cwd_on_posix(self):
+        # A Windows drive path is not absolute to a POSIX parent kernel.
+        with (
+            mock.patch.object(branch_state, "Path", PurePosixPath),
+            mock.patch.object(branch_state, "_resolve_pythonpath_paths", return_value=()),
+            mock.patch.object(branch_state, "resolve_dotenv_paths", return_value=(r"C:\secrets\.env",)),
+        ):
+            with self.assertRaisesRegex(BranchStateError, "relative dotenv"):
+                branch_state._runtime_paths(
+                    {"runtime": {"dotenv": [r"C:\secrets\.env"]}},
+                    PurePosixPath("/project/parent.py"),
                 )
 
     def test_missing_default_dotenv_is_preserved(self):
