@@ -233,6 +233,16 @@ class RuntimeCaptureTests(unittest.TestCase):
             self.assertIn(str(project / "pyproject.toml"), runtime.config_sources.values())
             self.assertNotIn("super-secret-value", metadata.read_text(encoding="utf-8"))
 
+    def test_effective_relative_user_config_dotenv_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            notebook = Path(directory) / "project" / "parent.py"
+            notebook.parent.mkdir()
+            notebook.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(BranchStateError, "relative dotenv"):
+                branch_state._runtime_paths(
+                    {"runtime": {"dotenv": [".user.env"]}}, notebook
+                )
+
     def test_missing_default_dotenv_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

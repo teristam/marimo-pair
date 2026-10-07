@@ -379,6 +379,20 @@ def _runtime_paths(
         raise BranchStateError(
             "<runtime.dotenv>", _type_name(dotenv_values), "capture", "expected a path list"
         )
+    # Project/script values and defaults are resolved by marimo. A remaining
+    # relative entry can come from user config, where marimo uses the parent
+    # cwd; re-anchoring it to the notebook/project could select another file.
+    relative_dotenv = [
+        str(path) for path in dotenv_values if not _is_absolute_path(str(path))
+    ]
+    if relative_dotenv:
+        raise BranchStateError(
+            "<runtime.dotenv>",
+            "path",
+            "capture",
+            "relative dotenv paths cannot be safely transferred; "
+            f"use an absolute path: {relative_dotenv[0]}",
+        )
     return (
         _resolve_pythonpath_paths(pythonpath_values, notebook),
         resolve_dotenv_paths(dotenv_values, notebook),
