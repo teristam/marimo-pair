@@ -241,6 +241,20 @@ class WorkerIntegrationTests(unittest.TestCase):
         self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["started"])
         return parent, notebook, marker, pythonpath, dotenv
 
+    def _create_parent_cell(self, parent: ParentServer, source: str):
+        nl = chr(10)
+        code = (
+            "import marimo._code_mode as cm" + nl
+            + "async with cm.get_context() as _pair_ctx:" + nl
+            + f"    _pair_id = _pair_ctx.create_cell({source!r})" + nl
+            + "    _pair_ctx.run_cell(_pair_id)" + nl
+            + "async with cm.get_context() as _pair_ctx:" + nl
+            + "    print('PARENT_CELL_STATUS:' + str(_pair_ctx.cells[_pair_id].status))" + nl
+        )
+        output = parent.execute(code)
+        if "PARENT_CELL_STATUS:idle" not in output:
+            raise AssertionError(f"Parent test cell did not complete: {output}")
+
     def _start_worker(self, manager: WorkerManager, parent: ParentServer, notebook: Path, names):
         captured = {}
         original_export = manager._export_parent
@@ -340,6 +354,97 @@ class WorkerIntegrationTests(unittest.TestCase):
                 self.assertEqual(manager.forced_kills, 0)
             finally:
                 manager.stop_all()
+                parent.close()
+
+    def test_later_named_batches_collisions_and_failed_export_keep_worker_usable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent, notebook, _, _, _ = self._start_parent(root, "notebook")
+            manager = WorkerManager(root_dir=root / "manager")
+            try:
+                worker, _ = self._start_worker(manager, parent, notebook, ["records"])
+                self._create_parent_cell(parent, "later_value = 731; shared_with_later_batch = records")
+                manager.add_worker(worker.worker_id, parent.session, ["later_value"])
+                value = manager.execute(worker.worker_id, "print(later_value)")
+                self.assertTrue(value.success, value.stderr)
+                self.assertIn("731", value.output)
+
+                manager.add_worker(worker.worker_id, parent.session, ["sample"])
+                alias = manager.execute(worker.worker_id, "print(sample.values is records)")
+                self.assertTrue(alias.success, alias.stderr)
+                self.assertIn("False", alias.output)
+
+                manager.execute(worker.worker_id, "agent_owned = 4")
+                with self.assertRaises(branch.BranchError):
+                    manager.add_worker(worker.worker_id, parent.session, ["agent_owned"])
+                self._create_parent_cell(parent, "restore_probe = 27")
+                original_export = manager._export_parent
+
+                def corrupt_batch(record, target, selected):
+                    original_export(record, target, selected)
+                    record.bundle_path.write_bytes(b"invalid pickle batch")
+
+                with mock.patch.object(manager, "_export_parent", side_effect=corrupt_batch):
+                    with self.assertRaises(branch.BranchError):
+                        manager.add_worker(worker.worker_id, parent.session, ["restore_probe"])
+                self.assertNotIn("restore_probe", manager._inspect_worker_names(worker))
+                still_usable = manager.execute(worker.worker_id, "print(records)")
+                self.assertTrue(still_usable.success, still_usable.stderr)
+
+                self._create_parent_cell(parent, "not_pickleable = lambda: 1")
+                with self.assertRaises(branch.BranchError) as failure:
+                    manager.add_worker(worker.worker_id, parent.session, ["not_pickleable"])
+                self.assertIn("not_pickleable", str(failure.exception))
+                self.assertIn("function", str(failure.exception))
+                usable = manager.execute(worker.worker_id, "print('still-usable')")
+                self.assertTrue(usable.success, usable.stderr)
+                self.assertIn("still-usable", usable.output)
+            finally:
+                manager.stop_all()
+                parent.close()
+
+    def test_cli_start_run_add_and_stop_are_separate_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent, notebook, _, _, _ = self._start_parent(root, "notebook")
+            manager_root = root / "cli-manager"
+            env = os.environ.copy()
+            env.update({"MARIMO_PAIR_HOME": str(manager_root), "MARIMO_TOKEN": parent.token,
+                        "PYTHONDONTWRITEBYTECODE": "1"})
+            script = SCRIPTS_DIR / "branch.py"
+
+            def cli(*args, input_text=None):
+                return subprocess.run(
+                    [sys.executable, "-B", str(script), *args], input=input_text,
+                    text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=60, env=env,
+                )
+
+            try:
+                started = cli("start", "--parent-url", parent.url, "--parent-session", parent.session,
+                              "--names", "records")
+                self.assertEqual(started.returncode, 0, started.stderr[-2000:])
+                record_data = json.loads(started.stdout)
+                worker_id = record_data["worker_id"]
+                self.assertTrue(WorkerManager(root_dir=manager_root).get_worker(worker_id).status == "running")
+
+                ran = cli("run", "--worker", worker_id, "-", input_text="print('from-cli-worker')")
+                self.assertEqual(ran.returncode, 0, ran.stderr[-2000:])
+                self.assertIn("from-cli-worker", ran.stdout)
+
+                self._create_parent_cell(parent, "cli_later = 'current-state'")
+                added = cli("add", "--worker", worker_id, "--parent-session", parent.session,
+                            "--names", "cli_later")
+                self.assertEqual(added.returncode, 0, added.stderr[-2000:])
+                self.assertIn("current state", added.stdout)
+                ran_later = cli("run", "--worker", worker_id, "-", input_text="print(cli_later)")
+                self.assertEqual(ran_later.returncode, 0, ran_later.stderr[-2000:])
+                self.assertIn("current-state", ran_later.stdout)
+
+                stopped = cli("stop", "--worker", worker_id)
+                self.assertEqual(stopped.returncode, 0, stopped.stderr[-2000:])
+                self.assertEqual(WorkerManager(root_dir=manager_root).list_workers(), [])
+            finally:
+                WorkerManager(root_dir=manager_root).stop_all()
                 parent.close()
 
     def test_script_header_overrides_project_runtime_and_uses_project_root_dotenv(self):

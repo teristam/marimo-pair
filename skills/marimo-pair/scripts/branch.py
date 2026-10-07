@@ -214,6 +214,15 @@ def redact_log_text(text: str, tokens: Sequence[str]) -> str:
 
 
 def _per_user_root() -> Path:
+    override = os.environ.get("MARIMO_PAIR_HOME")
+    if override:
+        candidate = Path(override).expanduser().absolute()
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        try:
+            candidate.resolve().relative_to(temp_root)
+        except (OSError, ValueError) as error:
+            raise BranchError("MARIMO_PAIR_HOME must remain inside the system temporary directory") from error
+        return candidate
     if os.name == "nt":
         user = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
     else:
@@ -724,6 +733,22 @@ class WorkerManager:
 
     def get_worker(self, worker_id: str) -> WorkerRecord:
         return self._read_record(worker_id)
+
+    def parent_target(self, url: str, session_id: str) -> ParentTarget:
+        """Resolve a current session to its notebook without global discovery."""
+        base = self._validate_parent_url(url)
+        token = os.environ.get("MARIMO_TOKEN")
+        if not token:
+            raise BranchError("Set MARIMO_TOKEN to authenticate to the parent session")
+        status, sessions = self._sessions(base, token)
+        entry = sessions.get(session_id) if sessions is not None else None
+        path = _session_path(entry)
+        if not 200 <= status < 300 or not path:
+            raise BranchError(f"Parent session {session_id!r} is not active or has no notebook path")
+        notebook = _real_path(path)
+        if not notebook.is_file():
+            raise BranchError(f"Parent notebook is not a regular file: {notebook}")
+        return ParentTarget(base, session_id, notebook)
 
     @staticmethod
     def read_token(record: WorkerRecord) -> str:
@@ -1255,6 +1280,121 @@ print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps({{"status": _bp_status, "names":
                 raise
         raise BranchError(f"Could not launch worker server: {last_error}") from last_error
 
+    def _inspect_worker_names(self, record: WorkerRecord) -> set[str]:
+        code = '''import json as _bp_json
+import marimo._code_mode as cm
+async with cm.get_context() as _bp_ctx:
+    _bp_names = sorted({name for _bp_cell in _bp_ctx.cells.values() for name in getattr(_bp_cell, "defs", ())})
+print("MARIMO_PAIR_WORKER_DEFS:" + _bp_json.dumps(_bp_names))
+'''
+        result = self._execute_record(record, code, validate=True)
+        marker = next((line for line in result.output.splitlines() if line.startswith("MARIMO_PAIR_WORKER_DEFS:")), None)
+        if not result.success or marker is None:
+            detail = result.stderr or result.output or "worker definitions could not be inspected"
+            raise BranchError(f"Could not inspect worker definitions before add: {detail[-1000:]}")
+        try:
+            names = json.loads(marker.partition(":")[2])
+        except ValueError as error:
+            raise BranchError("Worker definition response was invalid") from error
+        if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+            raise BranchError("Worker definition response was invalid")
+        return set(names)
+
+    def _add_bootstrap_code(self, record: WorkerRecord, names: Sequence[str]) -> str:
+        cell = build_worker_bootstrap_cell(
+            names, record.bundle_path, record.runtime_path, record.helper_path
+        )
+        name_list = repr(list(names))
+        return f'''import json as _bp_json
+import marimo._code_mode as cm
+_bp_cell_id = None
+try:
+    async with cm.get_context() as _bp_ctx:
+        _bp_cell_id = _bp_ctx.create_cell({cell!r})
+        _bp_ctx.run_cell(_bp_cell_id)
+except BaseException:
+    if _bp_cell_id is not None:
+        try:
+            async with cm.get_context() as _bp_cleanup_ctx:
+                _bp_cleanup_ctx.delete_cell(_bp_cell_id)
+        except BaseException:
+            pass
+    raise
+async with cm.get_context() as _bp_ctx:
+    _bp_status = str(_bp_ctx.cells[_bp_cell_id].status)
+_bp_result = {{"status": _bp_status, "names": {name_list}, "cell_id": _bp_cell_id}}
+print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps(_bp_result))
+'''
+
+    def _delete_worker_cell(self, record: WorkerRecord, cell_id: str) -> None:
+        code = f'''import marimo._code_mode as cm
+async with cm.get_context() as _bp_cleanup_ctx:
+    _bp_cleanup_ctx.delete_cell({cell_id!r})
+'''
+        result = self._execute_record(record, code, validate=True)
+        if not result.success:
+            raise BranchError(f"Could not roll back failed bootstrap cell {cell_id!r}: {result.stderr or result.output}")
+
+    def add_worker(self, worker_id: str, parent_session_id: str, names: Sequence[str]) -> None:
+        """Snapshot a fresh named parent batch into an existing worker."""
+        record = self._read_record(worker_id)
+        if record.status != "running":
+            raise BranchError(f"Worker {worker_id} is not ready for additions")
+        # Validate syntax and known bootstrap names before contacting either server.
+        selected = validate_names(names, record.imported_names)
+        self._validate_worker(record)
+        worker_definitions = self._inspect_worker_names(record)
+        selected = validate_names(selected, worker_definitions | set(record.imported_names))
+
+        parent = ParentTarget(record.parent_url, parent_session_id, record.parent_notebook_path)
+        canonical_parent = self._validate_parent(parent)
+        if not _same_notebook_path(canonical_parent, record.parent_notebook_path):
+            raise BranchError("Fresh parent session does not map to this worker's original notebook")
+        record.parent_session_id = parent_session_id
+        self._write_record(record)
+
+        try:
+            # Each batch is independent; private paths are reused only after the
+            # previous batch's artifacts have been removed.
+            for path in (record.bundle_path, record.runtime_path, record.helper_path):
+                self._remove_path(path)
+            shutil.copyfile(Path(branch_state.__file__).resolve(), record.helper_path)
+            if os.name != "nt":
+                record.helper_path.chmod(0o600)
+            self._export_parent(record, parent, selected)
+            runtime = read_parent_runtime(record.runtime_path)
+            if not _same_notebook_path(runtime.notebook_path, record.parent_notebook_path):
+                raise BranchError("Parent runtime metadata identifies a different notebook")
+            runtime_check = self._execute_record(
+                record, self._validate_runtime_code(record, runtime), validate=True
+            )
+            if not runtime_check.success:
+                raise BranchError(f"Parent runtime no longer matches this worker: {runtime_check.stderr or runtime_check.output}")
+            result = self._execute_record(record, self._add_bootstrap_code(record, selected), validate=True)
+            marker = next((line for line in result.output.splitlines() if line.startswith("MARIMO_PAIR_BOOTSTRAP:")), None)
+            status = None
+            if marker is not None:
+                try:
+                    status = json.loads(marker.partition(":")[2])
+                except ValueError as error:
+                    raise BranchError("Worker bootstrap result was invalid") from error
+            if not result.success or status is None or status.get("status") != "idle" or status.get("names") != list(selected):
+                rollback_error = None
+                if isinstance(status, dict) and status.get("cell_id"):
+                    try:
+                        self._delete_worker_cell(record, str(status["cell_id"]))
+                    except BranchError as error:
+                        rollback_error = error
+                detail = result.stderr or result.output or f"worker bootstrap did not complete: {status}"
+                if rollback_error is not None:
+                    detail = f"{detail}; rollback failed: {rollback_error}"
+                raise BranchError(f"Could not add values to worker {worker_id}: {detail[-1500:]}")
+            record.imported_names = tuple((*record.imported_names, *selected))
+            self._write_record(record)
+        finally:
+            for path in (record.bundle_path, record.runtime_path, record.helper_path):
+                self._remove_path(path)
+
     def _execute_record(self, record: WorkerRecord, code: str, *, validate: bool) -> ExecutionResult:
         if validate:
             self._validate_worker(record)
@@ -1463,9 +1603,84 @@ print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps({{"status": _bp_status, "names":
         return self._cleanup_record(record)
 
 
+def main(argv: Sequence[str] | None = None) -> int:
+    """Coordinator CLI; the run subcommand accepts only a worker ID and stdin."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Manage local marimo-pair branch workers")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    start = subparsers.add_parser("start", help="start a worker from named parent values")
+    start.add_argument("--parent-url", required=True)
+    start.add_argument("--parent-session", required=True)
+    start.add_argument("--names", nargs="+", required=True)
+
+    add = subparsers.add_parser("add", help="coordinator-only named export to a worker")
+    add.add_argument("--worker", required=True)
+    add.add_argument("--parent-session", required=True)
+    add.add_argument("--names", nargs="+", required=True)
+
+    run = subparsers.add_parser("run", help="execute stdin code in one explicit worker")
+    run.add_argument("--worker", required=True)
+    run.add_argument("source", choices=["-"])
+
+    subparsers.add_parser("list", help="list coordinator-owned workers")
+    stop = subparsers.add_parser("stop", help="stop one worker")
+    stop.add_argument("--worker", required=True)
+
+    args = parser.parse_args(argv)
+    manager = WorkerManager()
+    try:
+        if args.command == "start":
+            selected = validate_names(args.names)
+            parent = manager.parent_target(args.parent_url, args.parent_session)
+            record = manager.start_worker(parent, selected)
+            print(json.dumps({
+                "worker_id": record.worker_id,
+                "url": record.url,
+                "session_id": record.session_id,
+                "status": record.status,
+            }))
+            return 0
+        if args.command == "add":
+            manager.add_worker(args.worker, args.parent_session, args.names)
+            print("Added values from the parent's current state; later batches may reflect newer parent values.")
+            return 0
+        if args.command == "run":
+            stdin_buffer = getattr(sys.stdin, "buffer", None)
+            code = stdin_buffer.read().decode("utf-8") if stdin_buffer is not None else sys.stdin.read()
+            result = manager.execute(args.worker, code)
+            if result.output:
+                print(result.output, end="" if result.output.endswith("\n") else "\n")
+            if result.stderr:
+                print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+            return result.returncode if result.returncode != 0 else (0 if result.success else 1)
+        if args.command == "list":
+            print(json.dumps([
+                {
+                    "worker_id": record.worker_id,
+                    "url": record.url,
+                    "session_id": record.session_id,
+                    "status": record.status,
+                    "imported_names": list(record.imported_names),
+                }
+                for record in manager.list_workers()
+            ]))
+            return 0
+        manager.stop_worker(args.worker)
+        return 0
+    except (BranchError, ValueError, OSError) as error:
+        print(f"branch.py {args.command} failed: {error}", file=sys.stderr)
+        return 1
+
+
 __all__ = [
     "BranchError", "ExecutionResult", "ParentTarget", "SSEEvent", "WorkerManager",
-    "WorkerRecord", "parse_sse_records", "preflight_bash", "process_identity",
+    "WorkerRecord", "main", "parse_sse_records", "preflight_bash", "process_identity",
     "process_matches", "redact_log_text", "resolve_bash", "wait_for_kernel_ready",
     "wait_for_process",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

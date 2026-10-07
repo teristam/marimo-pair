@@ -315,6 +315,85 @@ class RegistryAndIdentityTests(unittest.TestCase):
 
 
 class WorkerManagerUnitTests(unittest.TestCase):
+    def test_add_rejects_all_private_names_and_existing_worker_names_before_parent_contact(self):
+        manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
+        record = mock.Mock(worker_id="a" * 32, imported_names=("records",), status="running")
+        with mock.patch.object(manager, "_read_record", return_value=record), mock.patch.object(
+            manager, "_validate_worker"
+        ), mock.patch.object(manager, "_inspect_worker_names", return_value={"from_agent"}), mock.patch.object(
+            manager, "_export_parent"
+        ) as export:
+            for names in (["records"], ["from_agent"], ["_private"], ["__dunder__"]):
+                with self.subTest(names=names), self.assertRaises((BranchError, ValueError)):
+                    manager.add_worker(record.worker_id, "fresh-session", names)
+        export.assert_not_called()
+
+    def test_add_validates_fresh_parent_session_path_before_export(self):
+        manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
+        record = mock.Mock(worker_id="b" * 32, imported_names=("records",), status="running")
+        with mock.patch.object(manager, "_read_record", return_value=record), mock.patch.object(
+            manager, "_validate_worker"
+        ), mock.patch.object(manager, "_inspect_worker_names", return_value=set()), mock.patch.object(
+            manager, "_validate_parent", side_effect=BranchError("stale session")
+        ) as validate, mock.patch.object(manager, "_export_parent") as export:
+            with self.assertRaises(BranchError):
+                manager.add_worker(record.worker_id, "stale-session", ["new_value"])
+        validate.assert_called_once()
+        export.assert_not_called()
+
+    def test_failed_add_rolls_back_new_cell_and_artifacts(self):
+        manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
+        record = mock.Mock(worker_id="c" * 32, imported_names=("records",), status="running")
+        record.temp_dir = Path(tempfile.mkdtemp())
+        record.parent_notebook_path = record.temp_dir / "parent.py"
+        record.parent_url = "http://127.0.0.1:1234"
+        record.bundle_path = record.temp_dir / "values.pickle"
+        record.runtime_path = record.temp_dir / "runtime.json"
+        record.helper_path = record.temp_dir / "branch_state.py"
+        record.bundle_path.write_bytes(b"bundle")
+        record.runtime_path.write_text("{}", encoding="utf-8")
+        runtime = branch_state.ParentRuntime(
+            notebook_path=str(record.temp_dir / "parent.py"), config_sources={}, cwd=str(record.temp_dir),
+            sys_path=(), python_executable=sys.executable, python_version=platform.python_version(),
+            pythonpath=(), dotenv=(), sandbox_context={}, dependency_context={},
+        )
+        with mock.patch.object(manager, "_read_record", return_value=record), mock.patch.object(
+            manager, "_validate_worker"
+        ), mock.patch.object(manager, "_inspect_worker_names", return_value=set()), mock.patch.object(
+            manager, "_validate_parent", return_value=str(record.temp_dir / "parent.py")
+        ), mock.patch.object(manager, "_export_parent"), mock.patch.object(manager, "_write_record"), mock.patch.object(
+            branch, "read_parent_runtime", return_value=runtime
+        ), mock.patch.object(manager, "_validate_runtime_code", return_value="verify runtime"), mock.patch.object(
+            manager, "_execute_record", side_effect=[
+                mock.Mock(success=True, output="", stderr=""),
+                mock.Mock(success=False, output="restore failed", stderr=""),
+            ]
+        ):
+            with self.assertRaises(BranchError):
+                manager.add_worker(record.worker_id, "fresh-session", ["new_value"])
+        self.assertFalse(record.bundle_path.exists())
+        self.assertFalse(record.runtime_path.exists())
+
+    def test_start_cli_rejects_private_names_before_parent_contact(self):
+        with mock.patch.object(branch.WorkerManager, "parent_target") as parent_target, mock.patch.object(
+            branch.sys, "stderr"
+        ):
+            self.assertEqual(branch.main([
+                "start", "--parent-url", "http://127.0.0.1:1234", "--parent-session", "s",
+                "--names", "_private",
+            ]), 1)
+        parent_target.assert_not_called()
+
+    def test_run_cli_routes_only_worker_id_and_uses_stdin(self):
+        source = "print('worker only')"
+        with mock.patch.object(branch.WorkerManager, "execute", return_value=mock.Mock(success=True, output="done", stderr="", returncode=0)) as execute, mock.patch.object(
+            branch.sys, "stdin", mock.Mock(read=mock.Mock(return_value=source), buffer=None)
+        ), mock.patch.object(branch.sys, "stdout") as stdout:
+            self.assertEqual(branch.main(["run", "--worker", "d" * 32, "-"]), 0)
+        execute.assert_called_once_with("d" * 32, source)
+        with mock.patch.object(branch.sys, "stderr"), self.assertRaises(SystemExit):
+            branch.main(["run", "--worker", "d" * 32, "--url", "http://127.0.0.1"])
+
     def _manager(self, root: Path) -> WorkerManager:
         return WorkerManager(root_dir=root, startup_timeout=0.2, request_timeout=0.2)
 
@@ -373,6 +452,7 @@ class WorkerManagerUnitTests(unittest.TestCase):
             )
             record.token_path.write_text("secret", encoding="utf-8")
             with (
+                mock.patch.dict(os.environ, {"MARIMO_TOKEN": "parent-secret"}),
                 mock.patch.object(manager, "_validate_worker", return_value=None),
                 mock.patch.object(manager, "_bash", return_value=Path("/bin/bash")),
                 mock.patch.object(branch.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="ok", stderr="")) as run,
@@ -389,6 +469,7 @@ class WorkerManagerUnitTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["input"], source)
             self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
             self.assertEqual(run.call_args.kwargs["env"]["MARIMO_TOKEN"], "secret")
+            self.assertNotEqual(run.call_args.kwargs["env"]["MARIMO_TOKEN"], "parent-secret")
             self.assertEqual(run.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
             self.assertEqual(result.output, "ok")
 

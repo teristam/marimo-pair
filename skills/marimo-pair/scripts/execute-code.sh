@@ -28,6 +28,7 @@ if [[ -n "${EXECUTE_CODE_LOG:-}" ]]; then
 fi
 
 code=""
+code_set=false
 url=""
 token="${MARIMO_TOKEN:-}"
 session=""
@@ -38,7 +39,7 @@ while [[ $# -gt 0 ]]; do
     --token)   token="$2"; shift 2 ;;
     --session) session="$2"; shift 2 ;;
     --file)    file="$2"; shift 2 ;;
-    -c)        code="$2"; shift 2 ;;
+    -c)        code="$2"; code_set=true; shift 2 ;;
     -)         break ;;
     -*)      echo "Unknown option: $1" >&2; usage ;;
     *)       break ;;
@@ -55,16 +56,19 @@ if [[ -n "$session" && -n "$file" ]]; then
   usage
 fi
 
-if [[ -n "$code" ]]; then
-  : # set via -c
+input_mode=""
+input_file=""
+if [[ "$code_set" == true ]]; then
+  input_mode="inline"
 elif [[ $# -gt 0 ]]; then
   if [[ "$1" == "-" ]]; then
-    code=$(cat)
+    input_mode="stdin"
   else
-    code=$(cat "$1")
+    input_mode="file"
+    input_file="$1"
   fi
 elif [[ ! -t 0 ]]; then
-  code=$(cat)
+  input_mode="stdin"
 else
   usage
 fi
@@ -186,6 +190,25 @@ done_received=false
 unparsed=""
 # An error body has no trailing newline, so keep what `read` got on its last,
 # failing call.
+send_execution_request() {
+  case "$input_mode" in
+    inline)
+      # printf is a shell builtin; source never becomes a jq/curl argument.
+      printf '%s' "$code" | jq -Rs '{code: .}'
+      ;;
+    file)
+      jq -Rs '{code: .}' < "$input_file"
+      ;;
+    stdin)
+      jq -Rs '{code: .}'
+      ;;
+  esac | curl -sN -X POST "${base}/api/kernel/execute" \
+    -H "Content-Type: application/json" \
+    -H "Marimo-Session-Id: ${session_id}" \
+    ${auth_args[@]+"${auth_args[@]}"} \
+    --data-binary @-
+}
+
 while { IFS= read -r line || [[ -n "$line" ]]; } && [[ "$done_received" == false ]]; do
   line="${line%$'\r'}" # SSE permits CRLF; `read` strips only the LF
   case "$line" in
@@ -218,12 +241,7 @@ while { IFS= read -r line || [[ -n "$line" ]]; } && [[ "$done_received" == false
       unparsed="${unparsed}${line}"$'\n'
       ;;
   esac
-done < <(curl -sN -X POST "${base}/api/kernel/execute" \
-  -H "Content-Type: application/json" \
-  -H "Marimo-Session-Id: ${session_id}" \
-  ${auth_args[@]+"${auth_args[@]}"} \
-  -d "$(jq -n --arg c "$code" '{code: $c}')" \
-)
+done < <(send_execution_request)
 
 if [[ "$done_received" == false ]]; then
   # No `done` event means the code never ran; without this we would exit 0.
