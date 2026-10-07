@@ -15,15 +15,20 @@ incorrectly.
 
 ## Auth
 
-For token-authenticated servers, prefer `MARIMO_TOKEN`.
+For token-authenticated servers, set `MARIMO_TOKEN` in the user- or
+harness-approved environment, then invoke the script without an inline
+assignment (which may not match an allowed command pattern):
 
 ```bash
-MARIMO_TOKEN=... bash scripts/execute-code.sh --url http://localhost:2718 -c "1 + 1"
+bash scripts/execute-code.sh --url http://localhost:2718 -c "1 + 1"
 ```
 
-`--token` also works, but may expose the token in process listings. If both are
-present, `--token` overrides `MARIMO_TOKEN`. The script sends the token as
-`Authorization: ******` on session discovery and code execution requests.
+`--token` also works, but exposes the token in process arguments. If both are
+present, `--token` overrides `MARIMO_TOKEN`. `execute-code.sh` places its
+bearer header in `curl`'s argv, so using the environment avoids the token in
+the script command itself but does not keep it out of every process listing.
+The script sends it in the `Authorization` header on session discovery and
+execution requests.
 
 ## Code Input
 
@@ -66,14 +71,19 @@ bash scripts/execute-code.sh --url http://localhost:2718 /tmp/code.py
 
 ## Branch-and-Explore Workers
 
-This is an optional coordinator workflow; ordinary pairing continues to use
-`execute-code.sh` and server discovery as described above. A branch worker is
-not selected through discovery. It has a unique worker ID, loopback URL,
-session, token, private temporary notebook, and kernel. The coordinator starts
-it from explicitly named values in an authenticated parent session:
+This optional coordinator workflow leaves ordinary pairing on
+`execute-code.sh` and server discovery. A branch worker is not selected through
+discovery; it has a worker ID, loopback URL, session, token, temporary notebook,
+and kernel. Branching requires a token-protected parent; a `--no-token` parent
+is rejected. The coordinator gets the parent URL, token, and current session ID
+from the user or an authenticated `/api/sessions` listing via separately
+approved coordinator HTTP tooling. Select the session entry matching the
+notebook's canonical path. `execute-code.sh` does not print the ID for a lone
+session. After reconnect, query the authenticated listing again for the current
+ID before `add`; never guess or reuse a stale ID.
 
 ```bash
-MARIMO_TOKEN="$PARENT_TOKEN" python /absolute/path/to/marimo-pair/scripts/branch.py start \
+python /absolute/path/to/marimo-pair/scripts/branch.py start \
   --parent-url http://127.0.0.1:2718 --parent-session "$PARENT_SESSION" \
   --names records latest_model
 ```
@@ -82,10 +92,15 @@ Before this, the coordinator must run and await the required parent `help(cm)`
 command using `execute-code.sh` with explicit `--url` and `--session`. The
 worker is only handed off after startup creates and validates its session,
 runs its own first code-mode inspection, and restores all requested names.
-Use `python3` if needed instead of `python`. The parent remains ordinary
-edit-mode and is not globally read-only; keep it idle during export because
-pickle hooks may execute user code. Workers do not replay parent preprocessing
-or copy the parent graph.
+Use `python3` if needed. Set `MARIMO_TOKEN` in the coordinator environment
+through user- or harness-approved secret injection before these commands; the
+commands begin with an allowed `bash`, `python`, or `python3` form, while an
+environment-assignment prefix may need explicit harness approval. Do not use
+`--token`, and do not propagate the parent token into the branch-agent
+environment. Environment variables are inherited by children. The parent is
+ordinary edit-mode, not globally read-only; keep it idle during export because
+pickle hooks may run user code. Workers do not replay preprocessing or copy
+the parent graph.
 
 ### Role boundary and commands
 
@@ -105,7 +120,7 @@ values sends a names-only request to the coordinator; the coordinator supplies
 the **current** parent session ID and runs:
 
 ```bash
-MARIMO_TOKEN="$PARENT_TOKEN" python /absolute/path/to/marimo-pair/scripts/branch.py add \
+python /absolute/path/to/marimo-pair/scripts/branch.py add \
   --worker WORKER_ID --parent-session "$CURRENT_PARENT_SESSION" --names new_value
 ```
 
@@ -116,37 +131,43 @@ python /absolute/path/to/marimo-pair/scripts/branch.py list
 python /absolute/path/to/marimo-pair/scripts/branch.py stop --worker WORKER_ID
 ```
 
-`add` revalidates the supplied session against the same canonical notebook as
-the original parent; refresh the session ID after a browser reconnect. Each
-batch snapshots the parent's current values and prints a warning that later
-batches can differ from earlier ones. Aliases are preserved only within one
-batch. Names already defined in the worker (including agent-created names)
-are rejected before contacting the parent: request a different name or restart
-the worker with all values needed together. If restore fails, the new bootstrap
-cell/artifacts are rolled back and prior worker cells remain usable. Serialize
-`add` and `stop` operations for the same worker through the coordinator.
+`add` revalidates the fresh session against the original canonical notebook.
+Each batch snapshots current parent values and warns that later batches may
+differ. Aliases survive only within one batch. Existing worker names (including
+agent-created ones) are rejected before contacting the parent. Restore rollback
+is attempted; if an error reports rollback failure, stop the worker. Prior
+cells remain usable when rollback succeeds. The coordinator must serialize
+same-worker `add` and `stop`: there is no per-worker lock.
 
-The shared skill's `allowed-tools` metadata does **not** enforce per-agent
-isolation. The coordinator must use handoff plus harness-level tool grants to
-withhold `add`, `start`, `list`, `stop`, direct `execute-code.sh`, discovery,
-parent URL/session, and parent token from branch agents, and scope their run
-grant to their assigned worker. Never put the parent token in a worker-agent
-environment. Parent export uses `execute-code.sh`, whose bearer token appears
-in `curl`'s argv; do not promise that the token is absent from every child
-process argument. This is not protection from other processes running as the
-same OS user.
+The shared skill's `allowed-tools` metadata is not per-agent isolation. Use
+handoff and harness grants to withhold coordinator commands, direct
+`execute-code.sh`, discovery, parent URL/session, and token from branch agents;
+scope run access to the assigned worker. The boundary only prevents accidental
+misrouting and keeps credentials out of agent prompts/environments; it is not
+a sandbox. Worker code is arbitrary code running as the same OS user and can
+read the shared registry/other worker token files, dotenv-derived values loaded
+in its environment, and potentially the parent token in transient `curl` argv.
+Use a separate OS account or container for actual containment; do not treat
+private temp files or harness handoff as protection from malicious or
+prompt-injected worker code.
 
 ### Runtime limits and cleanup
 
-V1 is same-host/local-loopback and same-OS only, and needs the parent's Python
-executable, import/config paths, and interpreter environment accessible to
-the worker. Unsupported or unpickleable values fail with the name/type; this
-is a value snapshot, not a clone of process state. Worker notebooks, tokens,
-and transfer artifacts live in a private per-user temporary area; dotenv
-secret values are not copied. There is no worker session TTL. On completion
-or cancellation, the coordinator runs `stop` to shut down the kernel/server
-and remove temporary files. If identity/session validation says a worker is
-lost, discard it; never reroute its agent to the parent.
+V1 is same-host/local-loopback, same-OS, and token-protected-parent only;
+the parent's Python executable and runtime paths must be accessible. Unsupported
+values fail with name/type. Worker files are in private per-user temp storage,
+but configured dotenv files are loaded, so their values may be readable in the
+worker. There is no session TTL. On completion/cancellation, run `stop`. After
+interrupted `start`, use `list` to find leftover IDs and stop them. A still-
+starting worker cannot yet be stopped; retry after startup settles. If `stop`
+retains files, keep its registry record and retry. For a lost worker, run
+`stop` to clean the dead/stale record; never reroute it to the parent. If
+startup needs a process-local SSE drainer that cannot survive the short-lived
+CLI, `start` cleans up and fails. `start`, `add`, and `run` require Bash with `jq` and
+`curl`; on Windows use validated Git Bash/Cygwin Bash, optionally selected via
+`MARIMO_PAIR_BASH`. Provide the branch agent only a read-only parent notebook
+path or sanitized excerpt for source inspection, without credentials; never
+grant live parent file edits.
 
 ## Starting marimo
 

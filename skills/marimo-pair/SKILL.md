@@ -49,16 +49,30 @@ Do not run task-specific `cm` code before the inspection command succeeds.
 
 ## Branch-and-Explore Workers
 
-Use this workflow only when parallel exploration needs mutable copies of live
+Use this workflow when parallel exploration needs mutable copies of live
 values without rerunning expensive parent preprocessing. Ordinary single-kernel
-pairing above remains unchanged.
+pairing below remains unchanged.
 
-The coordinator owns the parent URL, current session ID, and `MARIMO_TOKEN`.
-First run the required `help(cm)` command above against the parent using its
-explicit URL and session, for example:
+Branching requires a token-protected parent; a `--no-token` server is rejected.
+The coordinator obtains its URL, token, and current session ID from the user or
+an authenticated `/api/sessions` listing through separately approved
+coordinator HTTP tooling. Match the listing entry by the intended notebook's
+canonical path: `execute-code.sh` does not print an ID when only one session is
+open. After reconnect, requery for the current ID before `add`; do not guess or
+reuse a stale ID. Keep these parent credentials coordinator-only.
+
+Before branch commands, arrange `MARIMO_TOKEN` in the coordinator environment
+through user- or harness-approved secret injection. Commands must begin with
+`bash`, `python`, or `python3`; an environment assignment prefix may not match
+allowed command patterns and may need explicit harness approval. Do not use
+`--token`. Environment variables are inherited by child processes, and the
+parent exporter passes the bearer token in transient `curl` argv.
+
+First run and await the required `help(cm)` command above against the parent
+using its explicit URL and current session:
 
 ```bash
-MARIMO_TOKEN="$PARENT_TOKEN" bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
+bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
   --url http://127.0.0.1:2718 --session "$PARENT_SESSION" \
   -c "import marimo._code_mode as cm; help(cm)"
 ```
@@ -67,7 +81,7 @@ After it succeeds, the coordinator starts one private worker per branch agent,
 exporting only requested variable names from the live parent:
 
 ```bash
-MARIMO_TOKEN="$PARENT_TOKEN" python /absolute/path/to/marimo-pair/scripts/branch.py start \
+python /absolute/path/to/marimo-pair/scripts/branch.py start \
   --parent-url http://127.0.0.1:2718 --parent-session "$PARENT_SESSION" \
   --names records latest_model
 ```
@@ -89,7 +103,7 @@ and stop workers:
 
 ```bash
 python /absolute/path/to/marimo-pair/scripts/branch.py list
-MARIMO_TOKEN="$PARENT_TOKEN" python /absolute/path/to/marimo-pair/scripts/branch.py add \
+python /absolute/path/to/marimo-pair/scripts/branch.py add \
   --worker WORKER_ID --parent-session "$CURRENT_PARENT_SESSION" --names new_value
 python /absolute/path/to/marimo-pair/scripts/branch.py stop --worker WORKER_ID
 ```
@@ -102,31 +116,46 @@ Every batch is a snapshot of the parent's current state; keep the parent idle
 while exporting, because serialization hooks may run user code. Batch aliases
 are retained only within a single batch. Reject collisions with names already
 in the worker; choose new names or restart the worker to refresh existing
-values. If an export/restore batch fails, it is rolled back and earlier worker
-cells remain usable.
+values. Restore rollback is attempted. If an error reports rollback failure, stop
+that worker rather than continuing with uncertain state; earlier cells remain
+usable when rollback succeeds.
 
 Branch agents receive only `branch.py run --worker WORKER_ID -` (or an
 equivalent harness-scoped worker capability) and may ask the coordinator for
 more names. Never give them `add`, `start`, `list`, `stop`, parent URL/session,
-parent token, `execute-code.sh`, or server-discovery access. The `allowed-tools`
-list above is shared skill metadata, **not per-agent isolation**: this boundary
-exists only when the coordinator's handoff and harness-level tool grants deny
-those broader capabilities and scope run access to that worker. Do not pass the
-parent token in the worker-agent environment. The parent export helper sends
-its bearer token in `curl`'s command-line arguments; do not claim it is absent
-from every child process argument. This workflow is not a defense against
-other processes running as the same user.
+parent token, `execute-code.sh`, or server-discovery access. The shared
+`allowed-tools` list is not per-agent isolation: harness grants and handoff
+must withhold those broader capabilities and scope run access to that worker.
+This only prevents accidental misrouting and keeps credentials out of agent
+prompts/environments; it is **not a sandbox**. Worker code is arbitrary code
+running as the same OS user and can read the shared registry/other worker token
+files, dotenv-derived values loaded into its environment, and potentially the
+parent token in transient `curl` argv during export. Use a separate OS account
+or container for actual containment. Do not pass the parent token in the
+worker-agent environment; inline environment injection may require explicit
+harness approval.
 
 Workers use separate temporary notebooks and kernels; they do not copy the
-parent graph or rerun its preprocessing. Worker files/artifacts stay in a
-private per-user temporary area, and dotenv secret values are not copied.
-V1 requires a local loopback parent and worker on the same host/OS with
+parent graph or rerun preprocessing. Files stay in a private per-user temp
+area, but dotenv files are loaded by workers, so their values may be visible to
+worker code; not copying those files is not a secrecy boundary. V1 requires a
+token-protected, loopback parent and worker on the same host/OS with
 reproducible paths and the parent's Python environment. Unsupported values
 (such as notebook-local classes/functions, UI/state/runtime objects, or
 unpickleable resources) fail with an attributable error. Workers have no
-session TTL; stop them explicitly after use or cancellation. If a worker is
-lost, discard it rather than reconnecting the agent to the parent. The
-coordinator serializes `add` and `stop` operations for the same worker.
+session TTL; stop them explicitly. If `start` is interrupted, use `list` to
+find leftover IDs, then `stop`. `stop` refuses a still-starting worker; retry
+after startup settles. If stop retains files, keep its record and retry. For a
+lost worker, run `stop` to clean its dead/stale record; never reroute it to the
+parent.
+
+For source inspection, give the branch agent a read-only parent notebook path
+or sanitized excerpt, without credentials; never grant edits to the live
+parent artifact. `start`, `add`, and `run` need Bash plus `jq` and `curl`; on Windows
+use validated Git Bash/Cygwin Bash (`MARIMO_PAIR_BASH` can override). If
+startup requires a process-local SSE drainer that cannot outlive the short
+CLI, `start` cleans up and fails. Serialize same-worker `add` and `stop`
+operations yourself: the registry has no per-worker lock.
 
 The parent remains an ordinary edit-mode server, not globally read-only; this
 workflow only withholds arbitrary parent execution from branch agents.
@@ -165,10 +194,11 @@ with `bash /absolute/path/to/marimo-pair/scripts/discover-servers.sh`, MCP
 `--url`. With one notebook open, the script targets it automatically; with
 several, pass `--file` with the notebook's file key.
 
-If no server is running and the user wants a notebook, start marimo with
+If no server is running and the user wants ordinary pairing, start marimo with
 `--no-token` (and without `--headless`) so it auto-registers for discovery. The
-notebook UI must be open for `execute-code` to target it. The right invocation
-depends on context (project tooling, global install, sandbox mode). If the
+notebook UI must be open for `execute-code` to target it. Such a `--no-token`
+server cannot be a branch parent; branching requires token authentication. The right invocation depends on context (project
+tooling, global install, sandbox mode). If the
 notebook file contains a PEP 723 `#
 /// script` header, it MUST be opened with `--sandbox` — otherwise marimo
 ignores the inline dependencies. See
