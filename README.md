@@ -14,10 +14,11 @@
 ## Prerequisites
 
 - A running [marimo](https://marimo.io) notebook (`--no-token` for
-  auto-discovery; `MARIMO_TOKEN` env var for servers with auth)
-- `bash`, `curl`, and `jq` available on `PATH` (on Windows, run from
-  Git Bash, or from WSL with those tools installed in the distro — the
-  scripts also find notebooks running on the Windows host)
+  ordinary auto-discovery; Branch-and-Explore requires a token-protected parent
+  and `MARIMO_TOKEN` in the coordinator's environment)
+- Python, `bash`, `curl`, and `jq` available on `PATH` (on Windows, use Git Bash
+  or Cygwin for branch workers; ordinary pairing can also run from WSL, but
+  branching across the WSL/Windows OS boundary is unsupported)
 
 ## Install
 
@@ -54,6 +55,68 @@ To opt in to auto-updates (recommended), so you always get the latest version:
 /plugin → Marketplaces → marimo-pair → Enable auto-update
 ```
 
+## Branch-and-Explore
+
+Use isolated workers to explore mutable copies of selected **live** notebook
+values without rerunning the parent's preprocessing. The coordinator needs a
+local, token-protected parent, its URL, its **current session ID**, and
+`MARIMO_TOKEN` supplied through its own environment (not a branch agent's).
+Get the current session ID from the user or an authenticated `/api/sessions`
+listing; match the intended notebook path and refresh the ID after a browser
+reconnect. A `--no-token` parent cannot be used for branching.
+
+Replace `/absolute/path/to/marimo-pair` with the installed skill directory
+and use `python3` if `python` is unavailable. Run these commands from the
+coordinator, with `PARENT_URL` and `PARENT_SESSION` set to the selected parent
+and `MARIMO_TOKEN` already available:
+
+```bash
+# Inspect the parent once before using code-mode APIs.
+bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
+  --url "$PARENT_URL" --session "$PARENT_SESSION" \
+  -c "import marimo._code_mode as cm; help(cm)"
+
+# Start one worker per branch agent; save the returned worker_id as WORKER_ID.
+python /absolute/path/to/marimo-pair/scripts/branch.py start \
+  --parent-url "$PARENT_URL" --parent-session "$PARENT_SESSION" \
+  --names records
+```
+
+Give a branch agent only its worker ID and a harness-scoped ability to run
+against that ID. Worker code goes on stdin and never selects a server from
+global discovery:
+
+```bash
+python /absolute/path/to/marimo-pair/scripts/branch.py run --worker "$WORKER_ID" - <<'PY'
+print(records[:3])
+PY
+```
+
+If the agent needs another parent value, it sends the coordinator **names only**.
+The coordinator obtains the current parent session ID and performs the export;
+later batches snapshot the parent's *current* state, and existing worker names
+cannot be replaced:
+
+```bash
+python /absolute/path/to/marimo-pair/scripts/branch.py add \
+  --worker "$WORKER_ID" --parent-session "$CURRENT_PARENT_SESSION" \
+  --names latest_model
+python /absolute/path/to/marimo-pair/scripts/branch.py list
+python /absolute/path/to/marimo-pair/scripts/branch.py stop --worker "$WORKER_ID"
+```
+
+Never hand a branch agent the parent token, URL, `add`, direct
+`execute-code.sh`, or discovery access. The skill's shared `allowed-tools` is
+**not** per-agent isolation; enforce worker-specific grants in your harness.
+Workers share the parent's OS user, Python environment, working directory, and
+configured dotenv values: this prevents accidental kernel misrouting, **not**
+a malicious worker from accessing same-user files or secrets. Coordinate
+same-worker `add`/`stop` operations sequentially, and keep the coordinator and
+agent on the same OS and temporary registry root (set the same private
+`MARIMO_PAIR_HOME` if their temp directories differ). See the
+[skill workflow](skills/marimo-pair/SKILL.md#branch-and-explore-workers) for
+runtime limits and cleanup details.
+
 ## FAQ
 
 ### I keep getting prompted to allow Bash commands
@@ -73,6 +136,10 @@ paths to the scripts from the installed skill and add them to your
   }
 }
 ```
+
+Those broad permissions are for ordinary coordinator pairing, **not** branch
+agents. Grant branch agents only their specific worker's `branch.py run`
+capability; don't globally allow `branch.py *` on their behalf.
 
 ## Contributing
 
