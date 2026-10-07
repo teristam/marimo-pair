@@ -341,6 +341,18 @@ class WorkerIntegrationTests(unittest.TestCase):
             root = Path(directory)
             parent, notebook, marker, _, dotenv = self._start_parent(root, "notebook")
             before = hashlib.sha256(notebook.read_bytes()).hexdigest()
+
+            def parent_cells():
+                output = parent.execute(
+                    "import json as _pair_json\n"
+                    "import marimo._code_mode as cm\n"
+                    "async with cm.get_context() as _pair_ctx:\n"
+                    "    print('PARENT_CELLS:' + _pair_json.dumps(sorted(_pair_ctx.cells.keys())))\n"
+                )
+                marker_line = next(line for line in output.splitlines() if line.startswith("PARENT_CELLS:"))
+                return json.loads(marker_line.partition(":")[2])
+
+            graph_before = parent_cells()
             parent_values_before = parent.execute("print('PARENT_RECORDS:' + repr(records))")
             parent_record_line = next(line for line in parent_values_before.splitlines() if line.startswith("PARENT_RECORDS:"))
             self.assertEqual(parent_record_line, "PARENT_RECORDS:[1]")
@@ -354,15 +366,17 @@ class WorkerIntegrationTests(unittest.TestCase):
                 for worker in (first, second):
                     self.assertTrue(worker.temp_dir.is_relative_to(manager.temp_root))
                     self.assertNotIn(manager.read_token(worker), worker.log_path.read_text(encoding="utf-8", errors="replace"))
-                first_code = "records.append(10)\nsample.values.append(11)\nprint(records)"
-                second_code = "records.append(20)\nsample.values.append(21)\nprint(records)"
+                first_code = "records.append(10)\nsample.values.append(11)\nprint('BRANCH_RECORDS:' + repr(records))"
+                second_code = "records.append(20)\nsample.values.append(21)\nprint('BRANCH_RECORDS:' + repr(records))"
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     results = list(pool.map(lambda args: manager.execute(*args), [
                         (first.worker_id, first_code), (second.worker_id, second_code),
                     ]))
                 self.assertTrue(all(result.success for result in results), results)
-                self.assertIn("10", results[0].output)
-                self.assertIn("20", results[1].output)
+                self.assertIn("BRANCH_RECORDS:[1, 10, 11]", results[0].output)
+                self.assertIn("BRANCH_RECORDS:[1, 20, 21]", results[1].output)
+                self.assertNotIn("BRANCH_RECORDS:[1, 20, 21]", results[0].output)
+                self.assertNotIn("BRANCH_RECORDS:[1, 10, 11]", results[1].output)
                 context = self._verify_worker_context(manager, first.worker_id, "notebook")
                 self.assertEqual(context["pythonpath"], list(captured.pythonpath))
                 self.assertEqual(context["dotenv"], list(captured.dotenv))
@@ -373,6 +387,7 @@ class WorkerIntegrationTests(unittest.TestCase):
                 parent_record_line_after = next(line for line in parent_values_after.splitlines() if line.startswith("PARENT_RECORDS:"))
                 self.assertEqual(parent_record_line_after, parent_record_line)
                 self.assertEqual(hashlib.sha256(notebook.read_bytes()).hexdigest(), before)
+                self.assertEqual(parent_cells(), graph_before)
                 for worker in (first, second):
                     started = time.monotonic()
                     manager.stop_worker(worker.worker_id)
