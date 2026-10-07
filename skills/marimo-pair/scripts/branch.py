@@ -1164,8 +1164,7 @@ async with cm.get_context() as _bp_ctx:
     _bp_cell_id = _bp_ctx.create_cell({quoted_cell})
     _bp_ctx.run_cell(_bp_cell_id)
 _bp_status = str(_bp_ctx.cells[_bp_cell_id].status)
-_bp_names = {name_list}
-print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps({{"status": _bp_status, "names": _bp_names}}))
+print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps({{"status": _bp_status, "cell_id": _bp_cell_id}}))
 '''
 
     def _open_drainer(self, record: WorkerRecord, token: str) -> None:
@@ -1255,8 +1254,12 @@ print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps({{"status": _bp_status, "names":
                     result = json.loads(marker.partition(":")[2])
                 except ValueError as error:
                     raise BranchError("Worker bootstrap result was invalid") from error
-                if result.get("status") != "idle" or result.get("names") != list(record.imported_names):
-                    raise BranchError(f"Worker bootstrap did not complete every name: {result}")
+                if result.get("status") != "idle":
+                    raise BranchError(f"Worker bootstrap cell did not complete: {result}")
+                restored = self._inspect_worker_names(record)
+                missing = set(record.imported_names) - restored
+                if missing:
+                    raise BranchError(f"Worker bootstrap did not register requested names: {sorted(missing)}")
                 # A fallback drainer remains active through worker shutdown.
                 return
             except BaseException as error:
@@ -1284,7 +1287,7 @@ print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps({{"status": _bp_status, "names":
         code = '''import json as _bp_json
 import marimo._code_mode as cm
 async with cm.get_context() as _bp_ctx:
-    _bp_names = sorted({name for _bp_cell in _bp_ctx.cells.values() for name in getattr(_bp_cell, "defs", ())})
+    _bp_names = sorted({name for _bp_impl in _bp_ctx.graph.cells.values() for name in _bp_impl.defs})
 print("MARIMO_PAIR_WORKER_DEFS:" + _bp_json.dumps(_bp_names))
 '''
         result = self._execute_record(record, code, validate=True)
@@ -1304,7 +1307,6 @@ print("MARIMO_PAIR_WORKER_DEFS:" + _bp_json.dumps(_bp_names))
         cell = build_worker_bootstrap_cell(
             names, record.bundle_path, record.runtime_path, record.helper_path
         )
-        name_list = repr(list(names))
         return f'''import json as _bp_json
 import marimo._code_mode as cm
 _bp_cell_id = None
@@ -1322,7 +1324,7 @@ except BaseException:
     raise
 async with cm.get_context() as _bp_ctx:
     _bp_status = str(_bp_ctx.cells[_bp_cell_id].status)
-_bp_result = {{"status": _bp_status, "names": {name_list}, "cell_id": _bp_cell_id}}
+_bp_result = {{"status": _bp_status, "cell_id": _bp_cell_id}}
 print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps(_bp_result))
 '''
 
@@ -1341,10 +1343,16 @@ async with cm.get_context() as _bp_cleanup_ctx:
         if record.status != "running":
             raise BranchError(f"Worker {worker_id} is not ready for additions")
         # Validate syntax and known bootstrap names before contacting either server.
-        selected = validate_names(names, record.imported_names)
+        try:
+            selected = validate_names(names, record.imported_names)
+        except ValueError as error:
+            raise BranchError(str(error)) from error
         self._validate_worker(record)
         worker_definitions = self._inspect_worker_names(record)
-        selected = validate_names(selected, worker_definitions | set(record.imported_names))
+        try:
+            selected = validate_names(selected, worker_definitions | set(record.imported_names))
+        except ValueError as error:
+            raise BranchError(str(error)) from error
 
         parent = ParentTarget(record.parent_url, parent_session_id, record.parent_notebook_path)
         canonical_parent = self._validate_parent(parent)
@@ -1378,7 +1386,7 @@ async with cm.get_context() as _bp_cleanup_ctx:
                     status = json.loads(marker.partition(":")[2])
                 except ValueError as error:
                     raise BranchError("Worker bootstrap result was invalid") from error
-            if not result.success or status is None or status.get("status") != "idle" or status.get("names") != list(selected):
+            if not result.success or status is None or status.get("status") != "idle":
                 rollback_error = None
                 if isinstance(status, dict) and status.get("cell_id"):
                     try:
@@ -1389,6 +1397,21 @@ async with cm.get_context() as _bp_cleanup_ctx:
                 if rollback_error is not None:
                     detail = f"{detail}; rollback failed: {rollback_error}"
                 raise BranchError(f"Could not add values to worker {worker_id}: {detail[-1500:]}")
+            try:
+                restored_definitions = self._inspect_worker_names(record)
+            except BranchError as error:
+                try:
+                    self._delete_worker_cell(record, str(status["cell_id"]))
+                except BranchError as rollback_error:
+                    raise BranchError(f"Could not verify added names and rollback failed: {rollback_error}") from error
+                raise BranchError(f"Could not verify added names: {error}") from error
+            missing = set(selected) - restored_definitions
+            if missing:
+                try:
+                    self._delete_worker_cell(record, str(status["cell_id"]))
+                except BranchError as rollback_error:
+                    raise BranchError(f"Bootstrap omitted {sorted(missing)} and rollback failed: {rollback_error}")
+                raise BranchError(f"Worker bootstrap did not define requested names: {sorted(missing)}")
             record.imported_names = tuple((*record.imported_names, *selected))
             self._write_record(record)
         finally:
@@ -1603,6 +1626,27 @@ async with cm.get_context() as _bp_cleanup_ctx:
         return self._cleanup_record(record)
 
 
+def _write_cli_text(stream: Any, text: str) -> None:
+    """Write user-visible execution output as UTF-8 regardless of Windows ANSI code page."""
+    if not text:
+        return
+    data = text.encode("utf-8")
+    binary = getattr(stream, "buffer", None)
+    if binary is not None and callable(getattr(binary, "write", None)):
+        binary.write(data)
+        flush = getattr(binary, "flush", None)
+        if callable(flush):
+            flush()
+        return
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+    stream.write(data.decode("utf-8"))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Coordinator CLI; the run subcommand accepts only a worker ID and stdin."""
     import argparse
@@ -1635,6 +1679,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             selected = validate_names(args.names)
             parent = manager.parent_target(args.parent_url, args.parent_session)
             record = manager.start_worker(parent, selected)
+            if record.worker_id in manager._drainers:
+                try:
+                    manager.stop_worker(record.worker_id)
+                except BranchError as cleanup_error:
+                    raise BranchError(
+                        "Worker startup requires an SSE drainer that cannot survive this CLI process; "
+                        f"cleanup also failed: {cleanup_error}"
+                    ) from cleanup_error
+                raise BranchError(
+                    "Worker startup requires a process-local SSE drainer; use a persistent coordinator "
+                    "instead of the short-lived start CLI"
+                )
             print(json.dumps({
                 "worker_id": record.worker_id,
                 "url": record.url,
@@ -1651,9 +1707,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             code = stdin_buffer.read().decode("utf-8") if stdin_buffer is not None else sys.stdin.read()
             result = manager.execute(args.worker, code)
             if result.output:
-                print(result.output, end="" if result.output.endswith("\n") else "\n")
+                _write_cli_text(sys.stdout, result.output + ("" if result.output.endswith("\n") else "\n"))
             if result.stderr:
-                print(result.stderr, file=sys.stderr, end="" if result.stderr.endswith("\n") else "\n")
+                _write_cli_text(sys.stderr, result.stderr + ("" if result.stderr.endswith("\n") else "\n"))
             return result.returncode if result.returncode != 0 else (0 if result.success else 1)
         if args.command == "list":
             print(json.dumps([

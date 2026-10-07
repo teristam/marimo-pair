@@ -255,6 +255,32 @@ class WorkerIntegrationTests(unittest.TestCase):
         if "PARENT_CELL_STATUS:idle" not in output:
             raise AssertionError(f"Parent test cell did not complete: {output}")
 
+    def _create_worker_cell(self, manager: WorkerManager, worker_id: str, source: str):
+        nl = chr(10)
+        code = (
+            "import marimo._code_mode as cm" + nl
+            + "async with cm.get_context() as _pair_ctx:" + nl
+            + f"    _pair_id = _pair_ctx.create_cell({source!r})" + nl
+            + "    _pair_ctx.run_cell(_pair_id)" + nl
+        )
+        result = manager.execute(worker_id, code)
+        if not result.success:
+            raise AssertionError(f"Could not create worker fixture cell: {result.stderr or result.output}")
+
+    def _worker_cell_ids(self, manager: WorkerManager, worker_id: str):
+        nl = chr(10)
+        code = (
+            "import json as _pair_json" + nl
+            + "import marimo._code_mode as cm" + nl
+            + "async with cm.get_context() as _pair_ctx:" + nl
+            + "    print('PAIR_CELL_IDS:' + _pair_json.dumps(sorted(_pair_ctx.cells.keys())))" + nl
+        )
+        result = manager.execute(worker_id, code)
+        if not result.success:
+            raise AssertionError(f"Could not inspect worker cells: {result.stderr or result.output}")
+        marker = next(line for line in result.output.splitlines() if line.startswith("PAIR_CELL_IDS:"))
+        return json.loads(marker.partition(":")[2])
+
     def _start_worker(self, manager: WorkerManager, parent: ParentServer, notebook: Path, names):
         captured = {}
         original_export = manager._export_parent
@@ -374,9 +400,15 @@ class WorkerIntegrationTests(unittest.TestCase):
                 self.assertTrue(alias.success, alias.stderr)
                 self.assertIn("False", alias.output)
 
-                manager.execute(worker.worker_id, "agent_owned = 4")
-                with self.assertRaises(branch.BranchError):
-                    manager.add_worker(worker.worker_id, parent.session, ["agent_owned"])
+                self._create_parent_cell(parent, "agent_owned = 4")
+                self._create_worker_cell(manager, worker.worker_id, "agent_owned = 4")
+                with mock.patch.object(manager, "_validate_parent", wraps=manager._validate_parent) as validate_parent, mock.patch.object(
+                    manager, "_export_parent", wraps=manager._export_parent
+                ) as export_parent:
+                    with self.assertRaises(branch.BranchError):
+                        manager.add_worker(worker.worker_id, parent.session, ["agent_owned"])
+                validate_parent.assert_not_called()
+                export_parent.assert_not_called()
                 self._create_parent_cell(parent, "restore_probe = 27")
                 original_export = manager._export_parent
 
@@ -384,9 +416,12 @@ class WorkerIntegrationTests(unittest.TestCase):
                     original_export(record, target, selected)
                     record.bundle_path.write_bytes(b"invalid pickle batch")
 
+                cells_before_failed_restore = self._worker_cell_ids(manager, worker.worker_id)
                 with mock.patch.object(manager, "_export_parent", side_effect=corrupt_batch):
                     with self.assertRaises(branch.BranchError):
                         manager.add_worker(worker.worker_id, parent.session, ["restore_probe"])
+                cells_after_failed_restore = self._worker_cell_ids(manager, worker.worker_id)
+                self.assertEqual(cells_after_failed_restore, cells_before_failed_restore)
                 self.assertNotIn("restore_probe", manager._inspect_worker_names(worker))
                 still_usable = manager.execute(worker.worker_id, "print(records)")
                 self.assertTrue(still_usable.success, still_usable.stderr)
@@ -413,10 +448,14 @@ class WorkerIntegrationTests(unittest.TestCase):
                         "PYTHONDONTWRITEBYTECODE": "1"})
             script = SCRIPTS_DIR / "branch.py"
 
-            def cli(*args, input_text=None):
+            def cli(*args, input_text=None, worker_agent=False):
+                child_env = env.copy()
+                if worker_agent:
+                    child_env.pop("MARIMO_TOKEN", None)
+                    child_env["PYTHONIOENCODING"] = "cp1252:strict"
                 return subprocess.run(
                     [sys.executable, "-B", str(script), *args], input=input_text,
-                    text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=60, env=env,
+                    text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=60, env=child_env,
                 )
 
             try:
@@ -427,16 +466,16 @@ class WorkerIntegrationTests(unittest.TestCase):
                 worker_id = record_data["worker_id"]
                 self.assertTrue(WorkerManager(root_dir=manager_root).get_worker(worker_id).status == "running")
 
-                ran = cli("run", "--worker", worker_id, "-", input_text="print('from-cli-worker')")
+                ran = cli("run", "--worker", worker_id, "-", input_text="print('from-cli-worker 東京🚀')", worker_agent=True)
                 self.assertEqual(ran.returncode, 0, ran.stderr[-2000:])
-                self.assertIn("from-cli-worker", ran.stdout)
+                self.assertEqual(ran.stdout, "from-cli-worker 東京🚀" + chr(10) * 2)
 
                 self._create_parent_cell(parent, "cli_later = 'current-state'")
                 added = cli("add", "--worker", worker_id, "--parent-session", parent.session,
                             "--names", "cli_later")
                 self.assertEqual(added.returncode, 0, added.stderr[-2000:])
                 self.assertIn("current state", added.stdout)
-                ran_later = cli("run", "--worker", worker_id, "-", input_text="print(cli_later)")
+                ran_later = cli("run", "--worker", worker_id, "-", input_text="print(cli_later)", worker_agent=True)
                 self.assertEqual(ran_later.returncode, 0, ran_later.stderr[-2000:])
                 self.assertIn("current-state", ran_later.stdout)
 

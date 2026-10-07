@@ -321,12 +321,23 @@ class WorkerManagerUnitTests(unittest.TestCase):
         with mock.patch.object(manager, "_read_record", return_value=record), mock.patch.object(
             manager, "_validate_worker"
         ), mock.patch.object(manager, "_inspect_worker_names", return_value={"from_agent"}), mock.patch.object(
-            manager, "_export_parent"
-        ) as export:
+            manager, "_validate_parent"
+        ) as validate_parent, mock.patch.object(manager, "_export_parent") as export:
             for names in (["records"], ["from_agent"], ["_private"], ["__dunder__"]):
                 with self.subTest(names=names), self.assertRaises((BranchError, ValueError)):
                     manager.add_worker(record.worker_id, "fresh-session", names)
+        validate_parent.assert_not_called()
         export.assert_not_called()
+
+    def test_worker_definition_inspector_reads_graph_cell_definitions(self):
+        manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
+        record = mock.Mock(worker_id="e" * 32)
+        output = 'MARIMO_PAIR_WORKER_DEFS:["agent_owned"]'
+        with mock.patch.object(manager, "_execute_record", return_value=mock.Mock(success=True, output=output)) as execute:
+            self.assertEqual(manager._inspect_worker_names(record), {"agent_owned"})
+        generated = execute.call_args.args[1]
+        self.assertIn("_bp_ctx.graph.cells.values()", generated)
+        self.assertNotIn("getattr(_bp_cell,", generated)
 
     def test_add_validates_fresh_parent_session_path_before_export(self):
         manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
@@ -364,13 +375,18 @@ class WorkerManagerUnitTests(unittest.TestCase):
         ), mock.patch.object(manager, "_export_parent"), mock.patch.object(manager, "_write_record"), mock.patch.object(
             branch, "read_parent_runtime", return_value=runtime
         ), mock.patch.object(manager, "_validate_runtime_code", return_value="verify runtime"), mock.patch.object(
-            manager, "_execute_record", side_effect=[
-                mock.Mock(success=True, output="", stderr=""),
-                mock.Mock(success=False, output="restore failed", stderr=""),
-            ]
-        ):
+            manager, "_delete_worker_cell"
+        ) as delete_cell, mock.patch.object(manager, "_execute_record", side_effect=[
+            mock.Mock(success=True, output="", stderr=""),
+            mock.Mock(
+                success=True,
+                output='MARIMO_PAIR_BOOTSTRAP:{"status":"exception","names":["new_value"],"cell_id":"failed-cell"}',
+                stderr="",
+            ),
+        ]):
             with self.assertRaises(BranchError):
                 manager.add_worker(record.worker_id, "fresh-session", ["new_value"])
+        delete_cell.assert_called_once_with(record, "failed-cell")
         self.assertFalse(record.bundle_path.exists())
         self.assertFalse(record.runtime_path.exists())
 
@@ -383,6 +399,25 @@ class WorkerManagerUnitTests(unittest.TestCase):
                 "--names", "_private",
             ]), 1)
         parent_target.assert_not_called()
+
+    def test_cli_start_refuses_process_local_sse_drainer(self):
+        worker_id = "f" * 32
+        record = mock.Mock(worker_id=worker_id, url="http://127.0.0.1:1234", session_id="worker-session", status="running")
+
+        def initialize(manager):
+            manager._drainers = {worker_id: (mock.Mock(), mock.Mock(), mock.Mock())}
+
+        with mock.patch.object(branch.WorkerManager, "__init__", autospec=True, side_effect=initialize), mock.patch.object(
+            branch.WorkerManager, "parent_target", return_value=ParentTarget("http://127.0.0.1:4321", "parent", Path("parent.py"))
+        ), mock.patch.object(branch.WorkerManager, "start_worker", return_value=record), mock.patch.object(
+            branch.WorkerManager, "stop_worker"
+        ) as stop_worker, mock.patch.object(branch.sys, "stderr"):
+            result = branch.main([
+                "start", "--parent-url", "http://127.0.0.1:4321", "--parent-session", "parent",
+                "--names", "records",
+            ])
+        self.assertEqual(result, 1)
+        stop_worker.assert_called_once_with(worker_id)
 
     def test_run_cli_routes_only_worker_id_and_uses_stdin(self):
         source = "print('worker only')"

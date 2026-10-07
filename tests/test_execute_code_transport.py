@@ -124,6 +124,15 @@ class ExecuteCodeTransportTests(unittest.TestCase):
                 self.assertEqual(_FixtureHandler.headers[-1]["Marimo-Session-Id"], "session-1")
         self.assertEqual(_FixtureHandler.session_lookups, 2)
 
+    def test_missing_script_file_fails_before_any_server_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "missing.py"
+            completed = self._run([str(missing)])
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"readable", completed.stderr.lower())
+        self.assertEqual(_FixtureHandler.session_lookups, 0)
+        self.assertEqual(_FixtureHandler.bodies, [])
+
     def test_failed_or_missing_done_events_return_nonzero(self):
         for mode in ("failure", "missing"):
             _FixtureHandler.done_mode = mode

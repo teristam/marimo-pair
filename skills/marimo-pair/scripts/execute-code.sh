@@ -73,6 +73,11 @@ else
   usage
 fi
 
+if [[ "$input_mode" == "file" && ( ! -f "$input_file" || ! -r "$input_file" ) ]]; then
+  echo "Input code file is not a readable regular file: ${input_file}" >&2
+  exit 1
+fi
+
 missing=""
 for tool in jq curl; do
   command -v "$tool" >/dev/null 2>&1 || missing="${missing:+$missing, }$tool"
