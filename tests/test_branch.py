@@ -214,6 +214,17 @@ class RegistryAndIdentityTests(unittest.TestCase):
             self.assertEqual(process_identity(123), "win:0")
             self.assertTrue(branch._pid_alive_state(123))
 
+    def test_windows_wait_accepts_signaled_handle_with_no_live_identity(self):
+        signaled = mock.Mock()
+        signaled.OpenProcess.return_value = 17
+        signaled.WaitForSingleObject.return_value = 0  # WAIT_OBJECT_0
+        with (
+            mock.patch.object(branch.os, "name", "nt"),
+            mock.patch.object(branch, "_windows_kernel32", return_value=signaled),
+        ):
+            self.assertTrue(branch.wait_for_process(123, "win:0", 0.01))
+        signaled.CloseHandle.assert_called_once_with(17)
+
     def test_early_windows_worker_exit_does_not_wait_or_force_kill(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = WorkerManager(root_dir=Path(directory), startup_timeout=0.2)
@@ -520,6 +531,49 @@ class WorkerManagerUnitTests(unittest.TestCase):
             terminate.assert_called_once_with(record)
             self.assertFalse(manager._record_path(record.worker_id).exists())
             self.assertFalse(record.temp_dir.exists())
+
+    def test_windows_stop_cleans_up_after_taskkill_and_signaled_handle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(Path(directory))
+            worker_dir = Path(directory) / "worker"
+            worker_dir.mkdir()
+            record = branch.WorkerRecord(
+                worker_id="5" * 32, url="http://127.0.0.1:1111", session_id="s",
+                token_path=worker_dir / "token", notebook_path=worker_dir / "n.py",
+                temp_dir=worker_dir, runtime_path=worker_dir / "r.json",
+                parent_url="http://127.0.0.1:2222", parent_notebook_path=Path(directory) / "p.py",
+                parent_session_id="p", status="running", server_pid=123, process_identity="win:0",
+                imported_names=(), log_path=worker_dir / "w.log",
+                bundle_path=worker_dir / "b.pickle", helper_path=worker_dir / "h.py",
+            )
+            record.token_path.write_text("token", encoding="utf-8")
+            manager._write_record(record)
+            exited = False
+            kernel = mock.Mock()
+            kernel.OpenProcess.return_value = 17
+            kernel.WaitForSingleObject.side_effect = lambda *_: 0 if exited else 0x102
+
+            def taskkill(command, **kwargs):
+                nonlocal exited
+                self.assertEqual(command[:4], ["taskkill", "/T", "/F", "/PID"])
+                exited = True
+                return mock.Mock(returncode=0)
+
+            with (
+                mock.patch.object(branch.os, "name", "nt"),
+                mock.patch.object(branch, "_windows_kernel32", return_value=kernel),
+                mock.patch.object(branch, "process_identity", side_effect=lambda pid: None if exited else "win:0"),
+                mock.patch.object(branch.subprocess, "run", side_effect=taskkill) as run,
+                mock.patch.object(manager, "_validate_worker", side_effect=BranchError("session check failed")),
+                mock.patch.object(manager, "_http_request") as request,
+                self.assertRaises(BranchError),
+            ):
+                manager.stop_worker(record.worker_id)
+            run.assert_called_once()
+            request.assert_not_called()
+            self.assertEqual(manager.forced_kills, 1)
+            self.assertFalse(manager._record_path(record.worker_id).exists())
+            self.assertFalse(worker_dir.exists())
 
     def test_stop_worker_keeps_record_when_safe_termination_is_unconfirmed(self):
         with tempfile.TemporaryDirectory() as directory:

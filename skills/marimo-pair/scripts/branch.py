@@ -467,6 +467,10 @@ def wait_for_process(pid: int, identity: str | None, timeout: float) -> bool:
             if not handle:
                 return _pid_alive_state(pid) is False
             try:
+                # A signaled handle proves this process has exited, even when
+                # process_identity() can no longer return a live identity.
+                if kernel.WaitForSingleObject(handle, 0) == 0:
+                    return True
                 current = process_identity(pid)
                 if identity is None or current is None:
                     return False
