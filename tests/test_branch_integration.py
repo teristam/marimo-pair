@@ -1,0 +1,363 @@
+"""Opt-in end-to-end lifecycle checks against the installed marimo CLI."""
+
+import concurrent.futures
+import hashlib
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest import mock
+import urllib.request
+from pathlib import Path
+
+SCRIPTS_DIR = Path(__file__).parents[1] / "skills" / "marimo-pair" / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+import branch
+import branch_state
+from branch import ParentTarget, WorkerManager
+
+RUN_INTEGRATION = os.environ.get("MARIMO_PAIR_RUN_INTEGRATION") == "1"
+REPO_ROOT = Path(__file__).parents[1].resolve()
+
+
+def _port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _auth_request(url, token, *, session=None, method="GET", data=None, timeout=5):
+    headers = {"Authorization": f"Bearer {token}"}
+    if session:
+        headers["Marimo-Session-Id"] = session
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+class ParentServer:
+    def __init__(self, root: Path, notebook: Path, marker: Path):
+        self.root = root
+        self.notebook = notebook
+        self.marker = marker
+        self.port = _port()
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.token = "parent-test-token-" + os.urandom(8).hex()
+        self.token_path = root / "parent-token"
+        self.token_path.write_text(self.token, encoding="utf-8")
+        try:
+            self.token_path.chmod(0o600)
+        except OSError:
+            pass
+        self.log_path = root / "parent.log"
+        self.log = None
+        self.previous_token = os.environ.get("MARIMO_TOKEN")
+        env = os.environ.copy()
+        env.update({
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "MARIMO_PAIR_MARKER_PATH": str(marker),
+            "PYTHONPATH": str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", ""),
+        })
+        command = [
+            sys.executable, "-m", "marimo", "-q", "edit", str(notebook),
+            "--headless", "--host", "127.0.0.1", "--port", str(self.port),
+            "--token-password-file", str(self.token_path), "--no-skew-protection",
+            "--no-sandbox", "--skip-update-check",
+        ]
+        with self.log_path.open("wb") as log:
+            self.process = subprocess.Popen(
+                command, cwd=REPO_ROOT, env=env, stdin=subprocess.DEVNULL, stdout=log,
+                stderr=subprocess.STDOUT, close_fds=True)
+        os.environ["MARIMO_TOKEN"] = self.token
+        self.session = "branch-parent-" + os.urandom(8).hex()
+        self.sse = None
+
+    def start(self):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                raise AssertionError(f"Parent server exited: {self.log_path.read_text(errors='replace')}")
+            try:
+                with _auth_request(self.url + "/api/sessions", self.token, timeout=1) as response:
+                    if response.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.1)
+        else:
+            raise AssertionError(f"Parent server did not start: {self.log_path.read_text(errors='replace')}")
+        request = urllib.request.Request(
+            self.url + "/sse?session_id=" + self.session,
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        self.sse = urllib.request.urlopen(request, timeout=30)
+        branch.wait_for_kernel_ready(self.sse, timeout=30)
+        # Explicitly instantiate before polling status; edit startup can report idle before the app ran.
+        with _auth_request(
+            self.url + "/api/kernel/instantiate", self.token, session=self.session,
+            method="POST", data=b'{"objectIds": [], "values": [], "autoRun": true}', timeout=10,
+        ) as response:
+            self.assert_http_ok(response)
+        deadline = time.monotonic() + 30
+        last_status = None
+        while time.monotonic() < deadline:
+            try:
+                with _auth_request(
+                    self.url + "/api/kernel/status", self.token, session=self.session, timeout=5,
+                ) as response:
+                    last_status = json.loads(response.read())
+            except Exception as error:
+                last_status = {"error": str(error)}
+            if (
+                last_status.get("state") == "idle"
+                and self.marker.exists()
+                and self.marker.read_text(encoding="utf-8").splitlines() == ["started"]
+            ):
+                self.sse.close()
+                self.sse = None
+                return
+            time.sleep(0.1)
+        marker_text = self.marker.read_text(encoding="utf-8") if self.marker.exists() else "<absent>"
+        log_text = self.log_path.read_text(encoding="utf-8", errors="replace")
+        raise AssertionError(f"Parent did not instantiate to idle exactly once: status={last_status}, marker={marker_text!r}, log={log_text}")
+
+    @staticmethod
+    def assert_http_ok(response):
+        if not 200 <= response.status < 300:
+            raise AssertionError(f"unexpected HTTP status {response.status}")
+
+    def execute(self, code: str) -> str:
+        env = os.environ.copy()
+        env["MARIMO_TOKEN"] = self.token
+        completed = subprocess.run(
+            [str(branch.resolve_bash()), str(REPO_ROOT / "skills" / "marimo-pair" / "scripts" / "execute-code.sh"),
+             "--url", self.url, "--session", self.session, "-"],
+            input=code, text=True, capture_output=True, timeout=30, env=env, close_fds=True,
+        )
+        if completed.returncode:
+            raise AssertionError(completed.stderr or completed.stdout)
+        return completed.stdout
+
+    def close(self):
+        if self.sse is not None:
+            self.sse.close()
+        try:
+            if self.process.poll() is None:
+                try:
+                    with _auth_request(
+                        self.url + "/api/kernel/shutdown", self.token, session=self.session,
+                        method="POST", data=b"{}", timeout=2,
+                    ):
+                        pass
+                except Exception:
+                    pass
+                self.process.wait(timeout=5)
+        except Exception:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+        if self.previous_token is None:
+            os.environ.pop("MARIMO_TOKEN", None)
+        else:
+            os.environ["MARIMO_TOKEN"] = self.previous_token
+
+
+@unittest.skipUnless(RUN_INTEGRATION, "set MARIMO_PAIR_RUN_INTEGRATION=1 to run real-server integration tests")
+class WorkerIntegrationTests(unittest.TestCase):
+    def _write_notebook(self, root: Path, scenario: str) -> tuple[Path, Path, tuple[str, ...], tuple[str, ...]]:
+        marker = root / "marker.txt"
+        if scenario == "notebook":
+            source = REPO_ROOT / "tests" / "fixtures" / "branch_parent.py"
+            notebook = root / "parent-copy.py"
+            shutil.copyfile(source, notebook)
+            (root / ".env").write_text("PAIR_INTEGRATION_VALUE=notebook-dotenv\n", encoding="utf-8")
+            return notebook, marker, (), (str((root / ".env").resolve()),)
+
+        project = root / "project"
+        project.mkdir()
+        src = project / ("script-src" if scenario == "script" else "src")
+        src.mkdir()
+        module_name = "script_context" if scenario == "script" else "project_context"
+        (src / f"{module_name}.py").write_text("VALUE = 'module-" + scenario + "'\n", encoding="utf-8")
+        env_name = ".script.env" if scenario == "script" else ".env"
+        (project / env_name).write_text("PAIR_INTEGRATION_VALUE=" + scenario + "-dotenv\n", encoding="utf-8")
+        if scenario == "script":
+            (project / "project-src").mkdir()
+            (project / ".project.env").write_text("PAIR_INTEGRATION_VALUE=wrong-project-value\n", encoding="utf-8")
+            (project / "pyproject.toml").write_text(
+                '[tool.marimo.runtime]\npythonpath = ["project-src"]\ndotenv = [".project.env"]\n',
+                encoding="utf-8",
+            )
+            header = (
+                "# /// script\n# [tool.marimo.runtime]\n"
+                f"# pythonpath = [{json.dumps(str(src.resolve()))}]\n"
+                f'# dotenv = ["{env_name}"]\n# ///\n'
+            )
+        else:
+            (project / "pyproject.toml").write_text(
+                '[tool.marimo.runtime]\npythonpath = ["src"]\ndotenv = [".env"]\n',
+                encoding="utf-8",
+            )
+            header = ""
+        notebook = project / "parent.py"
+        notebook.write_text(
+            header
+            + "import marimo\napp = marimo.App()\n\n"
+            + "@app.cell\ndef _():\n"
+            + "    import os\n    from pathlib import Path\n"
+            + "    from tests.fixtures.branch_models import BranchModel\n"
+            + f"    from {module_name} import VALUE\n"
+            + "    _marker = Path(os.environ['MARIMO_PAIR_MARKER_PATH'])\n"
+            + "    if not _marker.exists(): _marker.write_text('started\\n', encoding='utf-8')\n"
+            + "    records = [1]\n    sample = BranchModel('parent', records)\n"
+            + "    return BranchModel, VALUE, records, sample\n",
+            encoding="utf-8",
+        )
+        if scenario == "script":
+            return notebook, marker, (str(src.resolve()),), (str((project / env_name).resolve()),)
+        return notebook, marker, (str(src.resolve()),), (str((project / env_name).resolve()),)
+
+    def _start_parent(self, root: Path, scenario: str):
+        notebook, marker, pythonpath, dotenv = self._write_notebook(root, scenario)
+        parent = ParentServer(root, notebook, marker)
+        try:
+            parent.start()
+        except BaseException:
+            parent.close()
+            raise
+        self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["started"])
+        return parent, notebook, marker, pythonpath, dotenv
+
+    def _start_worker(self, manager: WorkerManager, parent: ParentServer, notebook: Path, names):
+        captured = {}
+        original_export = manager._export_parent
+
+        def export_and_capture(record, target, selected):
+            original_export(record, target, selected)
+            captured["runtime"] = branch_state.read_parent_runtime(record.runtime_path)
+
+        with mock.patch.object(manager, "_export_parent", side_effect=export_and_capture):
+            worker = manager.start_worker(ParentTarget(parent.url, parent.session, notebook), names)
+        return worker, captured["runtime"]
+
+    def _verify_worker_context(self, manager: WorkerManager, worker_id: str, scenario: str):
+        module_value = "_context.VALUE" if scenario in {"project", "script"} else "None"
+        code = (
+            "import json, os, sys, importlib.util\n"
+            "from marimo._config.manager import get_default_config_manager\n"
+            f"_manager = get_default_config_manager(current_path={str(manager.get_worker(worker_id).notebook_path)!r})\n"
+            "_config = _manager.get_config(hide_secrets=False)\n"
+            "_runtime = _config.get('runtime', {})\n"
+            + ("import project_context as _context\n" if scenario == "project" else "")
+            + ("import script_context as _context\n" if scenario == "script" else "")
+            + f"print('BRANCH_CONTEXT:' + json.dumps({{'pythonpath': [os.path.abspath(p) for p in _runtime.get('pythonpath', [])], 'dotenv': [os.path.abspath(p) for p in _runtime.get('dotenv', [])], 'env': os.environ.get('PAIR_INTEGRATION_VALUE'), 'module': {module_value}, 'model_type': type(sample).__module__, 'sys_path': sys.path}}))\n"
+        )
+        result = manager.execute(worker_id, code)
+        self.assertTrue(result.success, result.output)
+        line = next((line for line in result.output.splitlines() if line.startswith("BRANCH_CONTEXT:")), None)
+        self.assertIsNotNone(line, result.output)
+        return json.loads(line.partition(":")[2])
+
+    def test_project_runtime_context_and_worker_log_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent, notebook, marker, pythonpath, dotenv = self._start_parent(root, "project")
+            manager = WorkerManager()
+            try:
+                worker, captured = self._start_worker(manager, parent, notebook, ["records", "sample"])
+                context = self._verify_worker_context(manager, worker.worker_id, "project")
+                self.assertEqual(context["pythonpath"], list(captured.pythonpath))
+                self.assertEqual(context["dotenv"], list(captured.dotenv))
+                self.assertEqual(context["env"], "project-dotenv")
+                self.assertEqual(context["module"], "module-project")
+                self.assertEqual(context["model_type"], "tests.fixtures.branch_models")
+                self.assertTrue(worker.temp_dir.is_relative_to(manager.temp_root))
+                self.assertNotEqual(worker.notebook_path, notebook.resolve())
+                self.assertNotIn(manager.read_token(worker), worker.log_path.read_text(encoding="utf-8", errors="replace"))
+                self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["started"])
+                manager.stop_worker(worker.worker_id)
+                self.assertEqual(manager.forced_kills, 0)
+            finally:
+                manager.stop_all()
+                parent.close()
+
+    def test_notebook_adjacent_dotenv_and_parallel_isolated_workers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent, notebook, marker, _, dotenv = self._start_parent(root, "notebook")
+            before = hashlib.sha256(notebook.read_bytes()).hexdigest()
+            parent_values_before = parent.execute("print('PARENT_RECORDS:' + repr(records))")
+            parent_record_line = next(line for line in parent_values_before.splitlines() if line.startswith("PARENT_RECORDS:"))
+            self.assertEqual(parent_record_line, "PARENT_RECORDS:[1]")
+            manager = WorkerManager()
+            try:
+                first, captured = self._start_worker(manager, parent, notebook, ["records", "sample"])
+                second, _ = self._start_worker(manager, parent, notebook, ["records", "sample"])
+                self.assertNotEqual(first.notebook_path, second.notebook_path)
+                self.assertNotEqual(first.notebook_path, notebook.resolve())
+                for worker in (first, second):
+                    self.assertTrue(worker.temp_dir.is_relative_to(manager.temp_root))
+                    self.assertNotIn(manager.read_token(worker), worker.log_path.read_text(encoding="utf-8", errors="replace"))
+                first_code = "records.append(10)\nsample.values.append(11)\nprint(records)"
+                second_code = "records.append(20)\nsample.values.append(21)\nprint(records)"
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    results = list(pool.map(lambda args: manager.execute(*args), [
+                        (first.worker_id, first_code), (second.worker_id, second_code),
+                    ]))
+                self.assertTrue(all(result.success for result in results), results)
+                self.assertIn("10", results[0].output)
+                self.assertIn("20", results[1].output)
+                context = self._verify_worker_context(manager, first.worker_id, "notebook")
+                self.assertEqual(context["pythonpath"], list(captured.pythonpath))
+                self.assertEqual(context["dotenv"], list(captured.dotenv))
+                self.assertEqual(context["env"], "notebook-dotenv")
+                self.assertEqual(context["model_type"], "tests.fixtures.branch_models")
+                self.assertEqual(marker.read_text(encoding="utf-8").splitlines(), ["started"])
+                parent_values_after = parent.execute("print('PARENT_RECORDS:' + repr(records))")
+                parent_record_line_after = next(line for line in parent_values_after.splitlines() if line.startswith("PARENT_RECORDS:"))
+                self.assertEqual(parent_record_line_after, parent_record_line)
+                self.assertEqual(hashlib.sha256(notebook.read_bytes()).hexdigest(), before)
+                for worker in (first, second):
+                    started = time.monotonic()
+                    manager.stop_worker(worker.worker_id)
+                    self.assertLess(time.monotonic() - started, 10)
+                self.assertEqual(manager.forced_kills, 0)
+            finally:
+                manager.stop_all()
+                parent.close()
+
+    def test_script_header_overrides_project_runtime_and_uses_project_root_dotenv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent, notebook, _, pythonpath, dotenv = self._start_parent(root, "script")
+            manager = WorkerManager()
+            try:
+                worker, captured = self._start_worker(manager, parent, notebook, ["records", "sample"])
+                context = self._verify_worker_context(manager, worker.worker_id, "script")
+                self.assertEqual(context["pythonpath"], list(captured.pythonpath))
+                self.assertEqual(context["dotenv"], list(captured.dotenv))
+                self.assertEqual(context["env"], "script-dotenv")
+                self.assertEqual(context["module"], "module-script")
+                self.assertEqual(context["model_type"], "tests.fixtures.branch_models")
+                self.assertTrue(worker.temp_dir.is_relative_to(manager.temp_root))
+                self.assertNotEqual(worker.notebook_path, notebook.resolve())
+                self.assertNotIn(manager.read_token(worker), worker.log_path.read_text(encoding="utf-8", errors="replace"))
+                manager.stop_worker(worker.worker_id)
+                self.assertEqual(manager.forced_kills, 0)
+            finally:
+                manager.stop_all()
+                parent.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
