@@ -339,6 +339,12 @@ def process_identity(pid: int) -> str | None:
             if not handle:
                 return None
             try:
+                # OpenProcess and GetProcessTimes can still succeed for an exited
+                # process while a Popen/other handle keeps its kernel object alive.
+                # A signaled handle is definitively gone, not a live PID identity.
+                wait_result = kernel.WaitForSingleObject(handle, 0)
+                if wait_result != 0x102:  # Only WAIT_TIMEOUT proves this process is still live.
+                    return None
                 creation, exit_time, kernel_time, user_time = _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME()
                 if not kernel.GetProcessTimes(
                     handle, ctypes.byref(creation), ctypes.byref(exit_time),
@@ -367,11 +373,18 @@ def process_identity(pid: int) -> str | None:
                 ["ps", "-p", str(pid), "-o", "lstart=,comm=,stat="],
                 capture_output=True, text=True, timeout=2, check=False,
             )
-            text = result.stdout.strip()
-            if result.returncode == 0 and text:
-                if text.split()[-1].startswith(("Z", "X")):
+            fields = result.stdout.strip().split()
+            # BSD ps lstart is five whitespace-separated fields. The trailing
+            # state is used only for liveness; it changes (S/I/R/...) over time
+            # and must not be part of the process-creation identity.
+            if result.returncode == 0 and len(fields) >= 7:
+                state = fields[-1]
+                if state.startswith(("Z", "X")):
                     return None
-                return f"mac:{text}"
+                start_time = " ".join(fields[:5])
+                executable = " ".join(fields[5:-1])
+                if start_time and executable:
+                    return f"mac:{start_time}:{executable}"
         except (OSError, subprocess.TimeoutExpired):
             pass
         return None
@@ -396,10 +409,17 @@ def _pid_alive_state(pid: int) -> bool | None:
     if os.name == "nt":
         try:
             kernel = _windows_kernel32()
-            handle = kernel.OpenProcess(0x00100000, False, pid)
+            handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
             if handle:
-                kernel.CloseHandle(handle)
-                return True
+                try:
+                    result = kernel.WaitForSingleObject(handle, 0)
+                    if result == 0:  # WAIT_OBJECT_0: process has exited
+                        return False
+                    if result == 0x102:  # WAIT_TIMEOUT: process is still running
+                        return True
+                    return None
+                finally:
+                    kernel.CloseHandle(handle)
             error = ctypes.get_last_error() if hasattr(ctypes, "get_last_error") else 0
             return False if error == 87 else None
         except (AttributeError, OSError):
@@ -886,7 +906,8 @@ class WorkerManager:
         ]
         try:
             result = subprocess.run(
-                command, input=code, text=True, capture_output=True, timeout=self.execution_timeout,
+                command, input=code, text=True, encoding="utf-8", capture_output=True,
+                timeout=self.execution_timeout,
                 cwd=str(record.parent_notebook_path.parent), env=env, close_fds=True,
             )
         except subprocess.TimeoutExpired as error:
@@ -1245,7 +1266,7 @@ print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps({{"status": _bp_status, "names":
         ]
         try:
             completed = subprocess.run(
-                command, input=code, text=True, capture_output=True,
+                command, input=code, text=True, encoding="utf-8", capture_output=True,
                 timeout=self.execution_timeout, env=env, close_fds=True,
             )
             return ExecutionResult(
@@ -1377,11 +1398,23 @@ print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps({{"status": _bp_status, "names":
             raise BranchError(f"Worker {worker_id} starter identity is unknown; refusing to remove its files")
         try:
             self._shutdown(record)
-        except BranchError:
-            # Lost processes are never contacted again. If no matching child is alive,
-            # this registry entry is stale and its private files can be removed.
+        except BranchError as error:
+            # Validation failed before shutdown could safely contact the server.
+            # If the recorded process is still ours, terminate only that verified
+            # process; if identity/liveness is uncertain, retain its recovery data.
             if _original_process_gone(record.server_pid, record.process_identity):
-                self._cleanup_record(record)
+                if not self._cleanup_record(record):
+                    raise BranchError(f"Could not remove stale worker {worker_id} temporary files") from error
+            elif process_matches(record.server_pid, record.process_identity):
+                if not self._terminate_if_same_process(record):
+                    raise BranchError(
+                        f"Worker {worker_id} could not be safely terminated after validation failed; "
+                        "its record and files were retained"
+                    ) from error
+                if not self._cleanup_record(record):
+                    raise BranchError(
+                        f"Worker {worker_id} terminated, but its private files could not be removed"
+                    ) from error
             raise
         if not self._cleanup_record(record):
             raise BranchError(f"Worker exited, but its private temporary files could not be removed: {record.temp_dir}")

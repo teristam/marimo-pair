@@ -150,6 +150,106 @@ class BashSelectionTests(unittest.TestCase):
 
 
 class RegistryAndIdentityTests(unittest.TestCase):
+    def test_linux_identity_uses_creation_time_and_liveness_detects_zombies(self):
+        def stat_line(state, start):
+            tail = [state, *(["0"] * 18), str(start)]
+            return f"123 (python) {' '.join(tail)}"
+
+        with (
+            mock.patch.object(branch.os, "name", "posix"),
+            mock.patch.object(branch.sys, "platform", "linux"),
+            mock.patch.object(branch.Path, "read_text", side_effect=[
+                stat_line("S", 9876), stat_line("I", 9876),
+                stat_line("Z", 9876), stat_line("Z", 9876),
+            ]),
+            mock.patch.object(branch, "_process_executable", return_value="/usr/bin/python"),
+        ):
+            sleeping = process_identity(123)
+            idle = process_identity(123)
+            self.assertEqual(sleeping, idle)
+            self.assertIsNone(process_identity(123))
+            self.assertFalse(branch._pid_alive_state(123))
+
+    def test_macos_identity_ignores_mutable_state_and_liveness_detects_zombies(self):
+        outputs = [
+            "Mon Oct  6 12:34:56 2026 /opt/python/bin/python S\n",
+            "Mon Oct  6 12:34:56 2026 /opt/python/bin/python I\n",
+            "Mon Oct  6 12:34:56 2026 /opt/python/bin/python Z\n",
+            "123 Z\n",
+        ]
+        with (
+            mock.patch.object(branch.os, "name", "posix"),
+            mock.patch.object(branch.sys, "platform", "darwin"),
+            mock.patch.object(branch.subprocess, "run", side_effect=[
+                mock.Mock(returncode=0, stdout=output) for output in outputs
+            ]),
+        ):
+            running = process_identity(123)
+            idle = process_identity(123)
+            self.assertEqual(running, idle)
+            self.assertIsNone(process_identity(123))
+            self.assertFalse(branch._pid_alive_state(123))
+
+    def test_windows_process_identity_and_liveness_reject_signaled_handle(self):
+        signaled = mock.Mock()
+        signaled.OpenProcess.return_value = 17
+        signaled.GetProcessTimes.return_value = 1
+        signaled.WaitForSingleObject.return_value = 0  # WAIT_OBJECT_0
+        with (
+            mock.patch.object(branch.os, "name", "nt"),
+            mock.patch.object(branch, "_windows_kernel32", return_value=signaled),
+        ):
+            self.assertIsNone(process_identity(123))
+            self.assertFalse(branch._pid_alive_state(123))
+            self.assertTrue(branch._original_process_gone(123, "win:0"))
+
+        live = mock.Mock()
+        live.OpenProcess.return_value = 17
+        live.GetProcessTimes.return_value = 1
+        live.WaitForSingleObject.return_value = 0x102  # WAIT_TIMEOUT
+        with (
+            mock.patch.object(branch.os, "name", "nt"),
+            mock.patch.object(branch, "_windows_kernel32", return_value=live),
+        ):
+            self.assertEqual(process_identity(123), "win:0")
+            self.assertTrue(branch._pid_alive_state(123))
+
+    def test_early_windows_worker_exit_does_not_wait_or_force_kill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = WorkerManager(root_dir=Path(directory), startup_timeout=0.2)
+            record = branch.WorkerRecord(
+                worker_id="9" * 32, url="http://127.0.0.1:1234", session_id="s",
+                token_path=Path(directory) / "token", notebook_path=Path(directory) / "n.py",
+                temp_dir=Path(directory) / "worker", runtime_path=Path(directory) / "r.json",
+                parent_url="http://127.0.0.1:4321", parent_notebook_path=Path(directory) / "p.py",
+                parent_session_id="p", status="starting", server_pid=123, process_identity="win:0",
+                imported_names=(), log_path=Path(directory) / "w.log",
+                bundle_path=Path(directory) / "b.pickle", helper_path=Path(directory) / "h.py",
+            )
+            record.temp_dir.mkdir()
+            process = mock.Mock(pid=123)
+            process.poll.return_value = 1
+            manager._processes[record.worker_id] = process
+            signaled = mock.Mock()
+            signaled.OpenProcess.return_value = 17
+            signaled.GetProcessTimes.return_value = 1
+            signaled.WaitForSingleObject.return_value = 0
+            started = time.monotonic()
+            with (
+                mock.patch.object(branch.os, "name", "nt"),
+                mock.patch.object(branch, "_windows_kernel32", return_value=signaled),
+                mock.patch.object(manager, "_http_request", return_value=(401, b"")) as request,
+                mock.patch.object(manager, "_terminate_if_same_process") as terminate,
+            ):
+                with self.assertRaises(BranchError):
+                    manager._wait_fresh_server(record, "secret")
+                self.assertTrue(manager._abort_worker(record))
+            self.assertLess(time.monotonic() - started, 0.15)
+            request.assert_not_called()
+            terminate.assert_not_called()
+            self.assertEqual(manager.forced_kills, 0)
+            self.assertFalse(manager._record_path(record.worker_id).exists())
+
     def test_independent_registry_files_allow_parallel_updates(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = WorkerManager(root_dir=Path(directory))
@@ -248,7 +348,7 @@ class WorkerManagerUnitTests(unittest.TestCase):
             request.assert_not_called()
             self.assertEqual(manager.get_worker(record.worker_id).status, "stopping")
 
-    def test_execute_script_uses_explicit_url_session_and_stdin_never_dash_c(self):
+    def test_execute_script_uses_explicit_url_session_and_utf8_stdin_never_dash_c(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = self._manager(Path(directory))
             record = branch.WorkerRecord(
@@ -266,7 +366,8 @@ class WorkerManagerUnitTests(unittest.TestCase):
                 mock.patch.object(manager, "_bash", return_value=Path("/bin/bash")),
                 mock.patch.object(branch.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="ok", stderr="")) as run,
             ):
-                result = manager.execute("w", "print('hello')", record=record)
+                source = "print('non-ASCII: 🚀')"
+                result = manager.execute("w", source, record=record)
             command = run.call_args.args[0]
             self.assertIn("--url", command)
             self.assertIn(record.url, command)
@@ -274,7 +375,8 @@ class WorkerManagerUnitTests(unittest.TestCase):
             self.assertIn(record.session_id, command)
             self.assertEqual(command[-1], "-")
             self.assertNotIn("-c", command)
-            self.assertEqual(run.call_args.kwargs["input"], "print('hello')")
+            self.assertEqual(run.call_args.kwargs["input"], source)
+            self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
             self.assertEqual(run.call_args.kwargs["env"]["MARIMO_TOKEN"], "secret")
             self.assertEqual(run.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
             self.assertEqual(result.output, "ok")
@@ -358,6 +460,95 @@ class WorkerManagerUnitTests(unittest.TestCase):
                     manager.start_worker(ParentTarget("http://127.0.0.1:1234", "p", notebook), ["records"])
             popen.assert_not_called()
             self.assertEqual(manager.list_workers(), [])
+
+    def test_parent_export_subprocess_uses_utf8_for_non_ascii_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "Zoë 🚀"
+            root.mkdir()
+            manager = self._manager(root)
+            notebook = root / "parent-🚀.py"
+            notebook.write_text("", encoding="utf-8")
+            record = branch.WorkerRecord(
+                worker_id="8" * 32, url="http://127.0.0.1:4567", session_id="s",
+                token_path=root / "token", notebook_path=root / "worker.py",
+                temp_dir=root, runtime_path=root / "runtime.json",
+                parent_url="http://127.0.0.1:2345", parent_notebook_path=notebook,
+                parent_session_id="p", status="starting", server_pid=None, process_identity=None,
+                imported_names=("records",), log_path=root / "worker.log",
+                bundle_path=root / "bundle.pickle", helper_path=root / "helper.py",
+            )
+            def run(command, **kwargs):
+                record.runtime_path.write_text("{}", encoding="utf-8")
+                record.bundle_path.write_bytes(b"values")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with (
+                mock.patch.dict(os.environ, {"MARIMO_TOKEN": "parent-secret"}),
+                mock.patch.object(manager, "_bash", return_value=Path("/bin/bash")),
+                mock.patch.object(branch.subprocess, "run", side_effect=run) as subprocess_run,
+            ):
+                manager._export_parent(record, ParentTarget(record.parent_url, "p", notebook), ["records"])
+            self.assertEqual(subprocess_run.call_args.kwargs["encoding"], "utf-8")
+            self.assertIn("🚀", subprocess_run.call_args.kwargs["input"])
+
+    def test_stop_worker_terminates_verified_process_after_session_validation_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(Path(directory))
+            worker_dir = Path(directory) / "worker"
+            worker_dir.mkdir()
+            record = branch.WorkerRecord(
+                worker_id="7" * 32, url="http://127.0.0.1:1111", session_id="s",
+                token_path=worker_dir / "token", notebook_path=worker_dir / "n.py",
+                temp_dir=worker_dir, runtime_path=worker_dir / "r.json",
+                parent_url="http://127.0.0.1:2222", parent_notebook_path=Path(directory) / "p.py",
+                parent_session_id="p", status="running", server_pid=123, process_identity="created-here",
+                imported_names=(), log_path=worker_dir / "w.log",
+                bundle_path=worker_dir / "b.pickle", helper_path=worker_dir / "h.py",
+            )
+            record.token_path.write_text("token", encoding="utf-8")
+            manager._write_record(record)
+            with (
+                mock.patch.object(manager, "_validate_worker", side_effect=BranchError("session check failed")),
+                mock.patch.object(manager, "_http_request") as request,
+                mock.patch.object(branch, "process_matches", return_value=True),
+                mock.patch.object(branch, "_original_process_gone", return_value=False),
+                mock.patch.object(manager, "_terminate_if_same_process", return_value=True) as terminate,
+                self.assertRaises(BranchError),
+            ):
+                manager.stop_worker(record.worker_id)
+            request.assert_not_called()
+            terminate.assert_called_once_with(record)
+            self.assertFalse(manager._record_path(record.worker_id).exists())
+            self.assertFalse(record.temp_dir.exists())
+
+    def test_stop_worker_keeps_record_when_safe_termination_is_unconfirmed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = self._manager(Path(directory))
+            worker_dir = Path(directory) / "worker"
+            worker_dir.mkdir()
+            record = branch.WorkerRecord(
+                worker_id="6" * 32, url="http://127.0.0.1:1111", session_id="s",
+                token_path=worker_dir / "token", notebook_path=worker_dir / "n.py",
+                temp_dir=worker_dir, runtime_path=worker_dir / "r.json",
+                parent_url="http://127.0.0.1:2222", parent_notebook_path=Path(directory) / "p.py",
+                parent_session_id="p", status="running", server_pid=123, process_identity="created-here",
+                imported_names=(), log_path=worker_dir / "w.log",
+                bundle_path=worker_dir / "b.pickle", helper_path=worker_dir / "h.py",
+            )
+            record.token_path.write_text("token", encoding="utf-8")
+            manager._write_record(record)
+            with (
+                mock.patch.object(manager, "_validate_worker", side_effect=BranchError("session check failed")),
+                mock.patch.object(manager, "_http_request") as request,
+                mock.patch.object(branch, "process_matches", return_value=True),
+                mock.patch.object(branch, "_original_process_gone", return_value=False),
+                mock.patch.object(manager, "_terminate_if_same_process", return_value=False),
+                self.assertRaises(BranchError),
+            ):
+                manager.stop_worker(record.worker_id)
+            request.assert_not_called()
+            self.assertTrue(manager._record_path(record.worker_id).exists())
+            self.assertTrue(record.temp_dir.exists())
 
     def test_startup_cancellation_cleans_provisional_registry_and_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:

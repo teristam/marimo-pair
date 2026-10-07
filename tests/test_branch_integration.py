@@ -78,6 +78,7 @@ class ParentServer:
         os.environ["MARIMO_TOKEN"] = self.token
         self.session = "branch-parent-" + os.urandom(8).hex()
         self.sse = None
+        self.code_mode_initialized = False
 
     def start(self):
         deadline = time.monotonic() + 30
@@ -121,6 +122,8 @@ class ParentServer:
             ):
                 self.sse.close()
                 self.sse = None
+                self.execute("import marimo._code_mode as cm; help(cm)")
+                self.code_mode_initialized = True
                 return
             time.sleep(0.1)
         marker_text = self.marker.read_text(encoding="utf-8") if self.marker.exists() else "<absent>"
@@ -138,7 +141,7 @@ class ParentServer:
         completed = subprocess.run(
             [str(branch.resolve_bash()), str(REPO_ROOT / "skills" / "marimo-pair" / "scripts" / "execute-code.sh"),
              "--url", self.url, "--session", self.session, "-"],
-            input=code, text=True, capture_output=True, timeout=30, env=env, close_fds=True,
+            input=code, text=True, encoding="utf-8", capture_output=True, timeout=30, env=env, close_fds=True,
         )
         if completed.returncode:
             raise AssertionError(completed.stderr or completed.stdout)
@@ -246,6 +249,7 @@ class WorkerIntegrationTests(unittest.TestCase):
             original_export(record, target, selected)
             captured["runtime"] = branch_state.read_parent_runtime(record.runtime_path)
 
+        self.assertTrue(parent.code_mode_initialized, "parent code mode must initialize before exporting values")
         with mock.patch.object(manager, "_export_parent", side_effect=export_and_capture):
             worker = manager.start_worker(ParentTarget(parent.url, parent.session, notebook), names)
         return worker, captured["runtime"]
@@ -272,7 +276,8 @@ class WorkerIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             parent, notebook, marker, pythonpath, dotenv = self._start_parent(root, "project")
-            manager = WorkerManager()
+            manager = WorkerManager(root_dir=root / "manager")
+            self.assertTrue(manager.root_dir.is_relative_to(root))
             try:
                 worker, captured = self._start_worker(manager, parent, notebook, ["records", "sample"])
                 context = self._verify_worker_context(manager, worker.worker_id, "project")
@@ -299,7 +304,8 @@ class WorkerIntegrationTests(unittest.TestCase):
             parent_values_before = parent.execute("print('PARENT_RECORDS:' + repr(records))")
             parent_record_line = next(line for line in parent_values_before.splitlines() if line.startswith("PARENT_RECORDS:"))
             self.assertEqual(parent_record_line, "PARENT_RECORDS:[1]")
-            manager = WorkerManager()
+            manager = WorkerManager(root_dir=root / "manager")
+            self.assertTrue(manager.root_dir.is_relative_to(root))
             try:
                 first, captured = self._start_worker(manager, parent, notebook, ["records", "sample"])
                 second, _ = self._start_worker(manager, parent, notebook, ["records", "sample"])
@@ -340,7 +346,8 @@ class WorkerIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             parent, notebook, _, pythonpath, dotenv = self._start_parent(root, "script")
-            manager = WorkerManager()
+            manager = WorkerManager(root_dir=root / "manager")
+            self.assertTrue(manager.root_dir.is_relative_to(root))
             try:
                 worker, captured = self._start_worker(manager, parent, notebook, ["records", "sample"])
                 context = self._verify_worker_context(manager, worker.worker_id, "script")
