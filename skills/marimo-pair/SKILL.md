@@ -5,7 +5,7 @@ description: >-
   the user does, inspect live notebook state, and commit durable notebook
   changes. Use when the user wants to start a marimo notebook or pair on an
   active marimo session.
-allowed-tools: Bash(bash **/scripts/discover-servers.sh *), Bash(bash **/scripts/execute-code.sh *), Read
+allowed-tools: Bash(bash **/scripts/discover-servers.sh *), Bash(bash **/scripts/execute-code.sh *), Bash(python **/scripts/branch.py *), Bash(python3 **/scripts/branch.py *), Read
 ---
 
 marimo is a reactive Python runtime for building reproducible Python programs
@@ -46,6 +46,90 @@ Follow this order for each kernel, including read-only tasks:
 3. Then use `cm.get_context()` or another `cm` API in a later call.
 
 Do not run task-specific `cm` code before the inspection command succeeds.
+
+## Branch-and-Explore Workers
+
+Use this workflow only when parallel exploration needs mutable copies of live
+values without rerunning expensive parent preprocessing. Ordinary single-kernel
+pairing above remains unchanged.
+
+The coordinator owns the parent URL, current session ID, and `MARIMO_TOKEN`.
+First run the required `help(cm)` command above against the parent using its
+explicit URL and session, for example:
+
+```bash
+MARIMO_TOKEN="$PARENT_TOKEN" bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
+  --url http://127.0.0.1:2718 --session "$PARENT_SESSION" \
+  -c "import marimo._code_mode as cm; help(cm)"
+```
+
+After it succeeds, the coordinator starts one private worker per branch agent,
+exporting only requested variable names from the live parent:
+
+```bash
+MARIMO_TOKEN="$PARENT_TOKEN" python /absolute/path/to/marimo-pair/scripts/branch.py start \
+  --parent-url http://127.0.0.1:2718 --parent-session "$PARENT_SESSION" \
+  --names records latest_model
+```
+
+Use `python3` instead of `python` where that is the available interpreter. The
+coordinator retains the returned `worker_id` and hands the agent only a
+worker-specific run capability. Worker code is sent on stdin, never routed by
+discovery or an arbitrary URL:
+
+```bash
+python /absolute/path/to/marimo-pair/scripts/branch.py run \
+  --worker WORKER_ID - <<'PY'
+print(records[:3])
+PY
+```
+
+The coordinator alone may inspect `branch.py list`, request additional values,
+and stop workers:
+
+```bash
+python /absolute/path/to/marimo-pair/scripts/branch.py list
+MARIMO_TOKEN="$PARENT_TOKEN" python /absolute/path/to/marimo-pair/scripts/branch.py add \
+  --worker WORKER_ID --parent-session "$CURRENT_PARENT_SESSION" --names new_value
+python /absolute/path/to/marimo-pair/scripts/branch.py stop --worker WORKER_ID
+```
+
+For each later batch, the branch agent sends the coordinator a **names-only**
+request; it must not invoke `add`. The coordinator supplies the current parent
+session ID (browser reconnects can change it) and runs `add`. The controller
+revalidates that session against the worker's original parent notebook path.
+Every batch is a snapshot of the parent's current state; keep the parent idle
+while exporting, because serialization hooks may run user code. Batch aliases
+are retained only within a single batch. Reject collisions with names already
+in the worker; choose new names or restart the worker to refresh existing
+values. If an export/restore batch fails, it is rolled back and earlier worker
+cells remain usable.
+
+Branch agents receive only `branch.py run --worker WORKER_ID -` (or an
+equivalent harness-scoped worker capability) and may ask the coordinator for
+more names. Never give them `add`, `start`, `list`, `stop`, parent URL/session,
+parent token, `execute-code.sh`, or server-discovery access. The `allowed-tools`
+list above is shared skill metadata, **not per-agent isolation**: this boundary
+exists only when the coordinator's handoff and harness-level tool grants deny
+those broader capabilities and scope run access to that worker. Do not pass the
+parent token in the worker-agent environment. The parent export helper sends
+its bearer token in `curl`'s command-line arguments; do not claim it is absent
+from every child process argument. This workflow is not a defense against
+other processes running as the same user.
+
+Workers use separate temporary notebooks and kernels; they do not copy the
+parent graph or rerun its preprocessing. Worker files/artifacts stay in a
+private per-user temporary area, and dotenv secret values are not copied.
+V1 requires a local loopback parent and worker on the same host/OS with
+reproducible paths and the parent's Python environment. Unsupported values
+(such as notebook-local classes/functions, UI/state/runtime objects, or
+unpickleable resources) fail with an attributable error. Workers have no
+session TTL; stop them explicitly after use or cancellation. If a worker is
+lost, discard it rather than reconnecting the agent to the parent. The
+coordinator serializes `add` and `stop` operations for the same worker.
+
+The parent remains an ordinary edit-mode server, not globally read-only; this
+workflow only withholds arbitrary parent execution from branch agents.
 
 ## Connect to a Notebook
 
