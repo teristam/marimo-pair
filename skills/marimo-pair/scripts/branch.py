@@ -1,8 +1,4 @@
-"""Authenticated local worker lifecycle for marimo-pair branches.
-
-This module intentionally has no general-purpose parent execution API or CLI;
-Task 3 owns the names-only add/run command surface.
-"""
+"""Authenticated worker lifecycle and coordinator-only branch commands."""
 
 from __future__ import annotations
 
@@ -639,7 +635,7 @@ class WorkerManager:
         *,
         startup_timeout: float = 45.0,
         request_timeout: float = 10.0,
-        execution_timeout: float = 300.0,
+        execution_timeout: float | None = 300.0,
         shutdown_timeout: float = 10.0,
     ) -> None:
         self.root_dir = Path(root_dir or _per_user_root()).expanduser().absolute()
@@ -1703,6 +1699,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("Added values from the parent's current state; later batches may reflect newer parent values.")
             return 0
         if args.command == "run":
+            # A timed-out transport cannot cancel code already running in the
+            # worker; avoid reporting failure and inviting duplicate side effects.
+            manager.execution_timeout = None
             stdin_buffer = getattr(sys.stdin, "buffer", None)
             code = stdin_buffer.read().decode("utf-8") if stdin_buffer is not None else sys.stdin.read()
             result = manager.execute(args.worker, code)

@@ -429,6 +429,21 @@ class WorkerManagerUnitTests(unittest.TestCase):
         with mock.patch.object(branch.sys, "stderr"), self.assertRaises(SystemExit):
             branch.main(["run", "--worker", "d" * 32, "--url", "http://127.0.0.1"])
 
+    def test_run_cli_does_not_time_out_code_that_may_keep_running(self):
+        observed = []
+
+        def execute(manager, worker_id, code):
+            observed.append(manager.execution_timeout)
+            return branch.ExecutionResult(True, "", "", 0)
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"MARIMO_PAIR_HOME": directory}
+        ), mock.patch.object(branch.WorkerManager, "execute", execute), mock.patch.object(
+            branch.sys, "stdin", mock.Mock(buffer=None, read=mock.Mock(return_value="print(1)"))
+        ):
+            self.assertEqual(branch.main(["run", "--worker", "a" * 32, "-"]), 0)
+        self.assertEqual(observed, [None])
+
     def _manager(self, root: Path) -> WorkerManager:
         return WorkerManager(root_dir=root, startup_timeout=0.2, request_timeout=0.2)
 

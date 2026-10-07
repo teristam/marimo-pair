@@ -115,7 +115,9 @@ PY
 ```
 
 The run command accepts source only on stdin and routes by worker ID to the
-recorded worker URL/session with its worker token. A branch agent needing more
+recorded worker URL/session with its worker token. The coordinator already ran
+`help(cm)` for this worker; the branch agent does not use discovery or direct
+`execute-code.sh`. A branch agent needing more
 values sends a names-only request to the coordinator; the coordinator supplies
 the **current** parent session ID and runs:
 
@@ -154,14 +156,19 @@ prompt-injected worker code.
 ### Runtime limits and cleanup
 
 V1 is same-host/local-loopback, same-OS, and token-protected-parent only;
-the parent's Python executable and runtime paths must be accessible. Unsupported
-values fail with name/type. Worker files are in private per-user temp storage,
+the parent's Python executable and runtime paths must be accessible. Workers
+share that Python environment and the parent's working directory; branch agents
+must not change packages or write project-relative files without approval.
+Coordinator and branch-agent commands must share the same `TMPDIR`/`TEMP`/`TMP`
+selection or private `MARIMO_PAIR_HOME` root to resolve the same worker ID. Unsupported values fail
+with name/type. Worker files are in private per-user temp storage,
 but configured dotenv files are loaded, so their values may be readable in the
 worker. There is no session TTL. On completion/cancellation, run `stop`. After
 interrupted `start`, use `list` to find leftover IDs and stop them after the
 `start` process settles. Do not call `stop` concurrently with its `start`. If `stop`
 retains files, keep its registry record and retry. For a lost worker, run
-`stop` to clean the dead/stale record; never reroute it to the parent. If
+`stop` to clean the dead/stale record; it may still exit nonzero after cleanup,
+so check `list` to confirm. Never reroute it to the parent. If
 startup needs a process-local SSE drainer that cannot survive the short-lived
 CLI, `start` cleans up and fails. `start`, `add`, and `run` require Bash with `jq` and
 `curl`; on Windows use validated Git Bash/Cygwin Bash, optionally selected via

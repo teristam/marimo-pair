@@ -31,7 +31,12 @@ replace `/absolute/path/to/marimo-pair` with that directory.
 
 ## Required first kernel command
 
-Start every code-mode session with this dedicated command:
+For ordinary pairing or coordinator parent access, start every code-mode session
+with this dedicated command. A handed-off branch worker has already had this
+inspection run by the coordinator: its agent uses only `branch.py run --worker`
+and skips direct `execute-code.sh` and discovery.
+
+Start with:
 
 ```bash
 bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
@@ -39,7 +44,7 @@ bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
   -c "import marimo._code_mode as cm; help(cm)"
 ```
 
-Follow this order for each kernel, including read-only tasks:
+For each coordinator-connected kernel, including read-only tasks, follow:
 
 1. Run the inspection command once.
 2. Wait for successful `help(cm)` output.
@@ -136,18 +141,22 @@ worker-agent environment; inline environment injection may require explicit
 harness approval.
 
 Workers use separate temporary notebooks and kernels; they do not copy the
-parent graph or rerun preprocessing. Files stay in a private per-user temp
-area, but dotenv files are loaded by workers, so their values may be visible to
-worker code; not copying those files is not a secrecy boundary. V1 requires a
+parent graph or rerun preprocessing. They still share the parent's Python
+environment and working directory: branch agents must not change packages or
+write project-relative files without user/coordinator approval. Files stay in
+a private per-user temp area, but dotenv files are loaded by workers, so their
+values may be visible to worker code; not copying those files is not a secrecy
+boundary. V1 requires a
 token-protected, loopback parent and worker on the same host/OS with
 reproducible paths and the parent's Python environment. Unsupported values
 (such as notebook-local classes/functions, UI/state/runtime objects, or
 unpickleable resources) fail with an attributable error. Workers have no
 session TTL; stop them explicitly. If `start` is interrupted, use `list` to
 find leftover IDs, then `stop` after the `start` process settles. Do not run
-`stop` concurrently with a worker's in-progress `start`. If stop retains files, keep its record and retry. For a
-lost worker, run `stop` to clean its dead/stale record; never reroute it to the
-parent.
+`stop` concurrently with a worker's in-progress `start`. If `stop` retains
+files, keep its record and retry. For a lost worker, run `stop` to clean its
+dead/stale record; it may still exit nonzero after cleanup, so check `list` to
+confirm. Never reroute it to the parent.
 
 For source inspection, give the branch agent a read-only parent notebook path
 or sanitized excerpt, without credentials; never grant edits to the live
@@ -155,7 +164,9 @@ parent artifact. `start`, `add`, and `run` need Bash plus `jq` and `curl`; on Wi
 use validated Git Bash/Cygwin Bash (`MARIMO_PAIR_BASH` can override). If
 startup requires a process-local SSE drainer that cannot outlive the short
 CLI, `start` cleans up and fails. Serialize same-worker `add` and `stop`
-operations yourself: the registry has no per-worker lock.
+operations yourself: the registry has no per-worker lock. Coordinator and
+branch-agent commands must share the same `TMPDIR`/`TEMP`/`TMP` selection or
+private `MARIMO_PAIR_HOME` root so the worker ID resolves to the same registry.
 
 The parent remains an ordinary edit-mode server, not globally read-only; this
 workflow only withholds arbitrary parent execution from branch agents.
