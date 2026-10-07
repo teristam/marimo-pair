@@ -144,8 +144,8 @@ reproducible paths and the parent's Python environment. Unsupported values
 (such as notebook-local classes/functions, UI/state/runtime objects, or
 unpickleable resources) fail with an attributable error. Workers have no
 session TTL; stop them explicitly. If `start` is interrupted, use `list` to
-find leftover IDs, then `stop`. `stop` refuses a still-starting worker; retry
-after startup settles. If stop retains files, keep its record and retry. For a
+find leftover IDs, then `stop` after the `start` process settles. Do not run
+`stop` concurrently with a worker's in-progress `start`. If stop retains files, keep its record and retry. For a
 lost worker, run `stop` to clean its dead/stale record; never reroute it to the
 parent.
 
@@ -197,8 +197,9 @@ several, pass `--file` with the notebook's file key.
 If no server is running and the user wants ordinary pairing, start marimo with
 `--no-token` (and without `--headless`) so it auto-registers for discovery. The
 notebook UI must be open for `execute-code` to target it. Such a `--no-token`
-server cannot be a branch parent; branching requires token authentication. The right invocation depends on context (project
-tooling, global install, sandbox mode). If the
+server cannot be a branch parent; branching requires token authentication.
+The right invocation depends on context (project tooling, global install,
+sandbox mode). If the
 notebook file contains a PEP 723 `#
 /// script` header, it MUST be opened with `--sandbox` — otherwise marimo
 ignores the inline dependencies. See

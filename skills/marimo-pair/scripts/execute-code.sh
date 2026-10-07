@@ -10,7 +10,8 @@
 # the session is resolved automatically. --file stably identifies a notebook;
 # --session targets an exact (but ephemeral) session ID.
 #
-# Auth: set MARIMO_TOKEN env var (preferred) or pass --token TOKEN (visible in ps).
+# Auth: set MARIMO_TOKEN in the coordinator environment (preferred) or pass
+# --token TOKEN. curl receives the bearer header in its argv in either case.
 set -euo pipefail
 
 usage() {

@@ -158,8 +158,8 @@ the parent's Python executable and runtime paths must be accessible. Unsupported
 values fail with name/type. Worker files are in private per-user temp storage,
 but configured dotenv files are loaded, so their values may be readable in the
 worker. There is no session TTL. On completion/cancellation, run `stop`. After
-interrupted `start`, use `list` to find leftover IDs and stop them. A still-
-starting worker cannot yet be stopped; retry after startup settles. If `stop`
+interrupted `start`, use `list` to find leftover IDs and stop them after the
+`start` process settles. Do not call `stop` concurrently with its `start`. If `stop`
 retains files, keep its registry record and retry. For a lost worker, run
 `stop` to clean the dead/stale record; never reroute it to the parent. If
 startup needs a process-local SSE drainer that cannot survive the short-lived
