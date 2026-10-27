@@ -60,7 +60,7 @@ To opt in to auto-updates (recommended), so you always get the latest version:
 
 Use isolated workers to explore mutable copies of selected **live** notebook
 values without rerunning the parent's preprocessing. The coordinator needs a
-local, token-protected parent, its URL, and a token file (not a branch agent's).
+local, token-protected parent, its URL, and a token file (coordinator-only, never a branch agent's).
 `branch.py` resolves the parent session itself from `--parent-notebook`; there
 is no session ID to look up or refresh after a browser reconnect. A `--no-token`
 parent cannot be used for branching.
@@ -107,7 +107,7 @@ python /absolute/path/to/marimo-pair/scripts/branch.py list
 python /absolute/path/to/marimo-pair/scripts/branch.py stop --worker "$WORKER_ID"
 ```
 
-Never hand a branch agent the parent token, URL, `add`, direct
+Never hand a branch agent the parent token, token file, URL, `add`, direct
 `execute-code.sh`, or discovery access. The skill's shared `allowed-tools` is
 **not** per-agent isolation; enforce worker-specific grants in your harness.
 Workers share the parent's OS user, Python environment, working directory, and

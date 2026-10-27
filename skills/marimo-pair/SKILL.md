@@ -127,7 +127,7 @@ usable when rollback succeeds.
 Branch agents receive only `branch.py run --worker WORKER_ID -` (or an
 equivalent harness-scoped worker capability) and may ask the coordinator for
 more names. Never give them `add`, `start`, `list`, `stop`, parent URL/session,
-parent token, `execute-code.sh`, or server-discovery access. The shared
+parent token, parent token file, `execute-code.sh`, or server-discovery access. The shared
 `allowed-tools` list is not per-agent isolation: harness grants and handoff
 must withhold those broader capabilities and scope run access to that worker.
 This only prevents accidental misrouting and keeps credentials out of agent
@@ -135,9 +135,8 @@ prompts/environments; it is **not a sandbox**. Worker code is arbitrary code
 running as the same OS user and can read the shared registry/other worker token
 files, dotenv-derived values loaded into its environment, and potentially the
 parent token while it is held by the coordinator's child processes during export. Use a separate OS account
-or container for actual containment. Do not pass the parent token in the
-worker-agent environment; inline environment injection may require explicit
-harness approval.
+or container for actual containment. Do not pass the parent token, its token
+file, or MARIMO_TOKEN/MARIMO_TOKEN_FILE into a branch agent's environment.
 
 Workers use separate temporary notebooks and kernels; they do not copy the
 parent graph or rerun preprocessing. They still share the parent's Python
