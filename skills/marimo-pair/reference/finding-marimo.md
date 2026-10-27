@@ -2,9 +2,9 @@
 
 Only servers started with `--no-token` register in the local server registry
 and are auto-discoverable — starting without a token makes discovery easier.
-If a server has a token, supply `MARIMO_TOKEN` in the coordinator's environment
-rather than using `--token`. The script still passes the bearer header in
-`curl`'s process arguments; this is not protection from other local processes.
+If a server has a token, supply it as a file (`--token-file` or
+`MARIMO_TOKEN_FILE`) rather than `--token`. The script passes the header to
+`curl` through a private temporary file, never in process arguments.
 
 ```sh
 marimo edit notebook.py --no-token [--sandbox]

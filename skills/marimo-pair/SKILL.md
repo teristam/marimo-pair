@@ -59,37 +59,37 @@ values without rerunning expensive parent preprocessing. Ordinary single-kernel
 pairing below remains unchanged.
 
 Branching requires a token-protected parent; a `--no-token` server is rejected.
-The coordinator obtains its URL, token, and current session ID from the user or
-an authenticated `/api/sessions` listing through separately approved
-coordinator HTTP tooling. Match the listing entry by the intended notebook's
-canonical path: `execute-code.sh` does not print an ID when only one session is
-open. After reconnect, requery for the current ID before `add`; do not guess or
-reuse a stale ID. Keep these parent credentials coordinator-only.
+The coordinator needs the parent URL (`localhost` or `127.0.0.1`) and a token
+file from the user. `branch.py` resolves the parent session itself from
+`--parent-notebook`, an exact `--parent-session`, or the lone open session, and
+errors (listing sessions) instead of guessing. Keep parent credentials
+coordinator-only.
 
-Before branch commands, arrange `MARIMO_TOKEN` in the coordinator environment
-through user- or harness-approved secret injection. Commands must begin with
-`bash`, `python`, or `python3`; an environment assignment prefix may not match
-allowed command patterns and may need explicit harness approval. Do not use
-`--token`. Environment variables are inherited by child processes, and the
-parent exporter passes the bearer token in transient `curl` argv.
+Pass the parent token as `--token-file PATH` (or set `MARIMO_TOKEN_FILE`) on
+`start` and `add`; avoid `--token` and inline environment assignments. Tokens
+reach `curl` through a private header file, not process arguments.
 
 First run and await the required `help(cm)` command above against the parent
-using its explicit URL and current session:
+using its explicit URL and notebook path:
 
 ```bash
 bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
-  --url http://127.0.0.1:2718 --session "$PARENT_SESSION" \
+  --url http://localhost:2718 --file /abs/path/notebook.py \
+  --token-file /path/to/token.txt \
   -c "import marimo._code_mode as cm; help(cm)"
 ```
 
-After it succeeds, the coordinator starts one private worker per branch agent,
-exporting only requested variable names from the live parent:
+After it succeeds, start one private worker per branch agent with a single
+export of only the requested names:
 
 ```bash
 python /absolute/path/to/marimo-pair/scripts/branch.py start \
-  --parent-url http://127.0.0.1:2718 --parent-session "$PARENT_SESSION" \
-  --names records latest_model
+  --parent-url http://localhost:2718 --parent-notebook /abs/path/notebook.py \
+  --token-file /path/to/token.txt --count 3 --names records latest_model
 ```
+
+`--count N` (1-16) prints a JSON list of workers sharing one snapshot; startup
+is all-or-nothing. Once started, workers fail independently.
 
 Use `python3` instead of `python` where that is the available interpreter. The
 coordinator retains the returned `worker_id` and hands the agent only a
@@ -109,14 +109,13 @@ and stop workers:
 ```bash
 python /absolute/path/to/marimo-pair/scripts/branch.py list
 python /absolute/path/to/marimo-pair/scripts/branch.py add \
-  --worker WORKER_ID --parent-session "$CURRENT_PARENT_SESSION" --names new_value
+  --worker WORKER_ID --token-file /path/to/token.txt --names new_value
 python /absolute/path/to/marimo-pair/scripts/branch.py stop --worker WORKER_ID
 ```
 
 For each later batch, the branch agent sends the coordinator a **names-only**
-request; it must not invoke `add`. The coordinator supplies the current parent
-session ID (browser reconnects can change it) and runs `add`. The controller
-revalidates that session against the worker's original parent notebook path.
+request; it must not invoke `add`. The coordinator runs `add`, which resolves the parent's current session for the
+worker's notebook and revalidates it.
 Every batch is a snapshot of the parent's current state; keep the parent idle
 while exporting, because serialization hooks may run user code. Batch aliases
 are retained only within a single batch. Reject collisions with names already
@@ -135,7 +134,7 @@ This only prevents accidental misrouting and keeps credentials out of agent
 prompts/environments; it is **not a sandbox**. Worker code is arbitrary code
 running as the same OS user and can read the shared registry/other worker token
 files, dotenv-derived values loaded into its environment, and potentially the
-parent token in transient `curl` argv during export. Use a separate OS account
+parent token while it is held by the coordinator's child processes during export. Use a separate OS account
 or container for actual containment. Do not pass the parent token in the
 worker-agent environment; inline environment injection may require explicit
 harness approval.

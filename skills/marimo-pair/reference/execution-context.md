@@ -15,20 +15,21 @@ incorrectly.
 
 ## Auth
 
-For token-authenticated servers, set `MARIMO_TOKEN` in the user- or
-harness-approved environment, then invoke the script without an inline
-assignment (which may not match an allowed command pattern):
+For token-authenticated servers, prefer a token file: set `MARIMO_TOKEN_FILE`
+(or pass `--token-file PATH`). `MARIMO_TOKEN` also works. Precedence is
+`--token` > `--token-file` > `MARIMO_TOKEN_FILE` > `MARIMO_TOKEN`.
 
 ```bash
-bash scripts/execute-code.sh --url http://localhost:2718 -c "1 + 1"
+bash scripts/execute-code.sh --url http://localhost:2718 \
+  --token-file /path/to/token.txt -c "1 + 1"
 ```
 
-`--token` also works, but exposes the token in process arguments. If both are
-present, `--token` overrides `MARIMO_TOKEN`. `execute-code.sh` places its
-bearer header in `curl`'s argv, so using the environment avoids the token in
-the script command itself but does not keep it out of every process listing.
-The script sends it in the `Authorization` header on session discovery and
-execution requests.
+The script hands `curl` the `Authorization` header through a private
+temporary file (`curl -H @file`, removed on exit), so the token never appears
+in `curl`'s process arguments. This needs curl 7.55 or newer. `--token TOKEN`
+still works but exposes the token in the script's own arguments and prints a
+warning. Token files may end in a newline; a token with any other control
+character is refused.
 
 ## Code Input
 
@@ -75,29 +76,31 @@ This optional coordinator workflow leaves ordinary pairing on
 `execute-code.sh` and server discovery. A branch worker is not selected through
 discovery; it has a worker ID, loopback URL, session, token, temporary notebook,
 and kernel. Branching requires a token-protected parent; a `--no-token` parent
-is rejected. The coordinator gets the parent URL, token, and current session ID
-from the user or an authenticated `/api/sessions` listing via separately
-approved coordinator HTTP tooling. Select the session entry matching the
-notebook's canonical path. `execute-code.sh` does not print the ID for a lone
-session. After reconnect, query the authenticated listing again for the current
-ID before `add`; never guess or reuse a stale ID.
+is rejected. The coordinator needs the parent URL (`localhost` or `127.0.0.1`)
+and a token file from the user. `branch.py` finds the parent session itself:
+by `--parent-notebook` path, by an exact `--parent-session` (listing key or
+`session_id`), or the lone open session. Ambiguity is an error that lists the
+open sessions; nothing is guessed.
 
 ```bash
 python /absolute/path/to/marimo-pair/scripts/branch.py start \
-  --parent-url http://127.0.0.1:2718 --parent-session "$PARENT_SESSION" \
-  --names records latest_model
+  --parent-url http://localhost:2718 --parent-notebook /abs/path/notebook.py \
+  --token-file /path/to/token.txt --count 3 --names records latest_model
 ```
 
+`--count N` (1-16) exports the named values once and starts N workers from
+that one snapshot, printing a JSON list (without `--count`, one JSON object).
+Startup is all-or-nothing: if any worker fails to start, every worker from that
+command is stopped. After `start` returns, workers are independent; a failing
+`run` affects only its worker.
+
 Before this, the coordinator must run and await the required parent `help(cm)`
-command using `execute-code.sh` with explicit `--url` and `--session`. The
+command using `execute-code.sh` with explicit `--url` and `--file /abs/path/notebook.py`. The
 worker is only handed off after startup creates and validates its session,
 runs its own first code-mode inspection, and restores all requested names.
-Use `python3` if needed. Set `MARIMO_TOKEN` in the coordinator environment
-through user- or harness-approved secret injection before these commands; the
-commands begin with an allowed `bash`, `python`, or `python3` form, while an
-environment-assignment prefix may need explicit harness approval. Do not use
-`--token`, and do not propagate the parent token into the branch-agent
-environment. Environment variables are inherited by children. The parent is
+Use `python3` if needed. Supply the parent token with `--token-file` (or `MARIMO_TOKEN_FILE`); do not
+use an inline environment assignment, which may not match allowed command
+patterns. Never pass the parent token or token file to branch agents. The parent is
 ordinary edit-mode, not globally read-only; keep it idle during export because
 pickle hooks may run user code. Workers do not replay preprocessing or copy
 the parent graph.
@@ -118,12 +121,12 @@ The run command accepts source only on stdin and routes by worker ID to the
 recorded worker URL/session with its worker token. The coordinator already ran
 `help(cm)` for this worker; the branch agent does not use discovery or direct
 `execute-code.sh`. A branch agent needing more
-values sends a names-only request to the coordinator; the coordinator supplies
-the **current** parent session ID and runs:
+values sends a names-only request to the coordinator; the coordinator runs `add`, which finds the parent's **current** session for the
+worker's notebook itself (browser reconnects rename sessions):
 
 ```bash
 python /absolute/path/to/marimo-pair/scripts/branch.py add \
-  --worker WORKER_ID --parent-session "$CURRENT_PARENT_SESSION" --names new_value
+  --worker WORKER_ID --token-file /path/to/token.txt --names new_value
 ```
 
 Additional coordinator operations:
@@ -148,7 +151,8 @@ scope run access to the assigned worker. The boundary only prevents accidental
 misrouting and keeps credentials out of agent prompts/environments; it is not
 a sandbox. Worker code is arbitrary code running as the same OS user and can
 read the shared registry/other worker token files, dotenv-derived values loaded
-in its environment, and potentially the parent token in transient `curl` argv.
+in its environment, and potentially the parent token while it is held by the coordinator's child
+processes during export.
 Use a separate OS account or container for actual containment; do not treat
 private temp files or harness handoff as protection from malicious or
 prompt-injected worker code.

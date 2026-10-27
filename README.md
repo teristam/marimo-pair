@@ -15,7 +15,8 @@
 
 - A running [marimo](https://marimo.io) notebook (`--no-token` for
   ordinary auto-discovery; Branch-and-Explore requires a token-protected parent
-  and `MARIMO_TOKEN` in the coordinator's environment)
+  and a token file, preferably via `MARIMO_TOKEN_FILE`/`--token-file` rather
+  than `MARIMO_TOKEN`)
 - Python, `bash`, `curl`, and `jq` available on `PATH` (on Windows, use Git Bash
   or Cygwin for branch workers; ordinary pairing can also run from WSL, but
   branching across the WSL/Windows OS boundary is unsupported)
@@ -59,28 +60,30 @@ To opt in to auto-updates (recommended), so you always get the latest version:
 
 Use isolated workers to explore mutable copies of selected **live** notebook
 values without rerunning the parent's preprocessing. The coordinator needs a
-local, token-protected parent, its URL, its **current session ID**, and
-`MARIMO_TOKEN` supplied through its own environment (not a branch agent's).
-Get the current session ID from the user or an authenticated `/api/sessions`
-listing; match the intended notebook path and refresh the ID after a browser
-reconnect. A `--no-token` parent cannot be used for branching.
+local, token-protected parent, its URL, and a token file (not a branch agent's).
+`branch.py` resolves the parent session itself from `--parent-notebook`; there
+is no session ID to look up or refresh after a browser reconnect. A `--no-token`
+parent cannot be used for branching.
 
 Replace `/absolute/path/to/marimo-pair` with the installed skill directory
 and use `python3` if `python` is unavailable. Run these commands from the
-coordinator, with `PARENT_URL` and `PARENT_SESSION` set to the selected parent
-and `MARIMO_TOKEN` already available:
+coordinator, with `PARENT_URL`, `PARENT_NOTEBOOK` (absolute path), and
+`TOKEN_FILE` set to the selected parent:
 
 ```bash
 # Inspect the parent once before using code-mode APIs.
 bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
-  --url "$PARENT_URL" --session "$PARENT_SESSION" \
+  --url "$PARENT_URL" --file "$PARENT_NOTEBOOK" --token-file "$TOKEN_FILE" \
   -c "import marimo._code_mode as cm; help(cm)"
 
 # Start one worker per branch agent; save the returned worker_id as WORKER_ID.
 python /absolute/path/to/marimo-pair/scripts/branch.py start \
-  --parent-url "$PARENT_URL" --parent-session "$PARENT_SESSION" \
-  --names records
+  --parent-url "$PARENT_URL" --parent-notebook "$PARENT_NOTEBOOK" \
+  --token-file "$TOKEN_FILE" --count 3 --names records
 ```
+
+`--count` prints a JSON list of workers sharing one snapshot; startup is
+all-or-nothing.
 
 Give a branch agent only its worker ID and a harness-scoped ability to run
 against that ID. Worker code goes on stdin and never selects a server from
@@ -93,14 +96,13 @@ PY
 ```
 
 If the agent needs another parent value, it sends the coordinator **names only**.
-The coordinator obtains the current parent session ID and performs the export;
+The coordinator runs `add`, which finds the parent's current session itself;
 later batches snapshot the parent's *current* state, and existing worker names
 cannot be replaced:
 
 ```bash
 python /absolute/path/to/marimo-pair/scripts/branch.py add \
-  --worker "$WORKER_ID" --parent-session "$CURRENT_PARENT_SESSION" \
-  --names latest_model
+  --worker "$WORKER_ID" --token-file "$TOKEN_FILE" --names latest_model
 python /absolute/path/to/marimo-pair/scripts/branch.py list
 python /absolute/path/to/marimo-pair/scripts/branch.py stop --worker "$WORKER_ID"
 ```
