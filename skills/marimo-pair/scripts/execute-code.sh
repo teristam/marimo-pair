@@ -10,8 +10,10 @@
 # the session is resolved automatically. --file stably identifies a notebook;
 # --session targets an exact (but ephemeral) session ID.
 #
-# Auth: set MARIMO_TOKEN in the coordinator environment (preferred) or pass
-# --token TOKEN. curl receives the bearer header in its argv in either case.
+# Auth: set MARIMO_TOKEN_FILE (preferred) or MARIMO_TOKEN, or pass
+# --token-file PATH. The bearer header reaches curl through a private
+# temporary header file (curl -H @file), never through curl's argv.
+# --token TOKEN still works but exposes the token in this script's argv.
 set -euo pipefail
 
 usage() {
@@ -19,7 +21,7 @@ usage() {
   echo "       execute-code.sh --url URL [--file PATH | --session ID] -" >&2
   echo "       execute-code.sh --url URL [--file PATH | --session ID] script.py" >&2
   echo "URL:   run discover-servers.sh; it reports the url to use." >&2
-  echo "Auth:  set MARIMO_TOKEN env var (preferred) or pass --token TOKEN" >&2
+  echo "Auth:  set MARIMO_TOKEN_FILE or MARIMO_TOKEN, or pass --token-file PATH" >&2
   exit 1
 }
 
@@ -31,13 +33,17 @@ fi
 code=""
 code_set=false
 url=""
-token="${MARIMO_TOKEN:-}"
+token=""
+token_flag=""
+token_flag_set=false
+token_file=""
 session=""
 file=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --url)     url="$2"; shift 2 ;;
-    --token)   token="$2"; shift 2 ;;
+    --token)      token_flag="$2"; token_flag_set=true; shift 2 ;;
+    --token-file) token_file="$2"; shift 2 ;;
     --session) session="$2"; shift 2 ;;
     --file)    file="$2"; shift 2 ;;
     -c)        code="$2"; code_set=true; shift 2 ;;
@@ -79,6 +85,33 @@ if [[ "$input_mode" == "file" && ( ! -f "$input_file" || ! -r "$input_file" ) ]]
   exit 1
 fi
 
+# Resolve the bearer token: --token, --token-file, MARIMO_TOKEN_FILE, MARIMO_TOKEN.
+if [[ "$token_flag_set" == true ]]; then
+  echo "Warning: --token exposes the token in process arguments; prefer --token-file or MARIMO_TOKEN_FILE." >&2
+  token="$token_flag"
+else
+  token_file="${token_file:-${MARIMO_TOKEN_FILE:-}}"
+  if [[ -n "$token_file" ]]; then
+    if [[ ! -f "$token_file" || ! -r "$token_file" ]]; then
+      echo "Token file is not a readable regular file: ${token_file}" >&2
+      exit 1
+    fi
+    # $(<file) is read by the shell itself, so no process argv sees the token.
+    token=$(<"$token_file")
+    token="${token%$'\r'}"
+    if [[ -z "$token" ]]; then
+      echo "Token file is empty: ${token_file}" >&2
+      exit 1
+    fi
+  else
+    token="${MARIMO_TOKEN:-}"
+  fi
+fi
+if [[ "$token" == *[[:cntrl:]]* ]]; then
+  echo "The auth token contains control characters; refusing to send it." >&2
+  exit 1
+fi
+
 missing=""
 for tool in jq curl; do
   command -v "$tool" >/dev/null 2>&1 || missing="${missing:+$missing, }$tool"
@@ -86,6 +119,20 @@ done
 if [[ -n "$missing" ]]; then
   echo "execute-code.sh needs ${missing} on PATH." >&2
   exit 1
+fi
+
+# curl reads headers from a file (-H @file) only since 7.55; older versions
+# would send the literal "@path" and fail authentication confusingly.
+if [[ -n "$token" ]]; then
+  curl_version=$(curl --version 2>/dev/null | awk 'NR == 1 { print $2 }') || curl_version=""
+  curl_major="${curl_version%%.*}"
+  curl_minor="${curl_version#*.}"
+  curl_minor="${curl_minor%%.*}"
+  if ! [[ "$curl_major" =~ ^[0-9]+$ && "$curl_minor" =~ ^[0-9]+$ ]] \
+    || (( curl_major < 7 || (curl_major == 7 && curl_minor < 55) )); then
+    echo "execute-code.sh needs curl >= 7.55 to send the auth header from a file (found ${curl_version:-unknown})." >&2
+    exit 1
+  fi
 fi
 
 base="${url%/}"
@@ -119,10 +166,23 @@ case "$url_host" in
     ;;
 esac
 
-# Build optional auth header
+# Hand curl the bearer header through a private file so the token never
+# appears in any process's argv. The file is removed on every exit path.
 auth_args=()
+auth_header_file=""
+remove_auth_header() {
+  if [[ -n "$auth_header_file" ]]; then
+    rm -f -- "$auth_header_file"
+  fi
+}
 if [[ -n "$token" ]]; then
-  auth_args+=(-H "Authorization: Bearer ${token}")
+  trap remove_auth_header EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  auth_header_file=$(umask 077 && mktemp "${TMPDIR:-/tmp}/marimo-pair-auth.XXXXXX")
+  printf 'Authorization: Bearer %s\n' "$token" > "$auth_header_file"
+  auth_args+=(-H "@${auth_header_file}")
 fi
 
 # Resolve session ID. A file key is stable across browser reconnects, while a
