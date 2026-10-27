@@ -14,13 +14,21 @@ def _():
 
 @app.cell
 def _(sns):
-    df = sns.load_dataset('iris')
-    return (df,)
+    df_iris = sns.load_dataset('iris')
+    df_crashes = sns.load_dataset('car_crashes')
+    df_mri = sns.load_dataset('fmri')
+    return (df_crashes,)
 
 
 @app.cell
 def _(df):
     df
+    return
+
+
+@app.cell
+def _(df_crashes):
+    df_crashes
     return
 
 

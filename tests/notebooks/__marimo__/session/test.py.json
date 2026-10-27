@@ -19,8 +19,8 @@
       "console": []
     },
     {
-      "id": "MnIH",
-      "code_hash": "b99dfd6ff635c8a2c4161ac83fcf8a23",
+      "id": "MJUe",
+      "code_hash": "883ccaa2b655d34f399dd94509d65bf7",
       "outputs": [
         {
           "type": "data",
@@ -32,7 +32,7 @@
       "console": []
     },
     {
-      "id": "OEyr",
+      "id": "vblA",
       "code_hash": "eff7d5dba32b4da32d9a67a519434d3f",
       "outputs": [
         {
@@ -45,7 +45,20 @@
       "console": []
     },
     {
-      "id": "uSSP",
+      "id": "bkHC",
+      "code_hash": "1f18d5307d7fde96984e9c4f0485ff29",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/html": "<marimo-ui-element object-id='bkHC-0' random-id='9930987d-8464-274a-0cda-149121cd2e54'><marimo-table data-initial-value='[]' data-label='null' data-data='&quot;[{&#92;&quot;total&#92;&quot;:18.8,&#92;&quot;speeding&#92;&quot;:7.332000000000001,&#92;&quot;alcohol&#92;&quot;:5.64,&#92;&quot;not_distracted&#92;&quot;:18.048000000000002,&#92;&quot;no_previous&#92;&quot;:15.04,&#92;&quot;ins_premium&#92;&quot;:784.55,&#92;&quot;ins_losses&#92;&quot;:145.08,&#92;&quot;abbrev&#92;&quot;:&#92;&quot;AL&#92;&quot;},{&#92;&quot;total&#92;&quot;:18.1,&#92;&quot;speeding&#92;&quot;:7.421,&#92;&quot;alcohol&#92;&quot;:4.525,&#92;&quot;not_distracted&#92;&quot;:16.290000000000003,&#92;&quot;no_previous&#92;&quot;:17.014,&#92;&quot;ins_premium&#92;&quot;:1053.48,&#92;&quot;ins_losses&#92;&quot;:133.93,&#92;&quot;abbrev&#92;&quot;:&#92;&quot;AK&#92;&quot;},{&#92;&quot;total&#92;&quot;:18.6,&#92;&quot;speeding&#92;&quot;:6.51,&#92;&quot;alcohol&#92;&quot;:5.208000000000001,&#92;&quot;not_distracted&#92;&quot;:15.624,&#92;&quot;no_previous&#92;&quot;:17.856,&#92;&quot;ins_premium&#92;&quot;:899.47,&#92;&quot;ins_losses&#92;&quot;:110.35,&#92;&quot;abbrev&#92;&quot;:&#92;&quot;AZ&#92;&quot;},{&#92;&quot;total&#92;&quot;:22.4,&#92;&quot;speeding&#92;&quot;:4.032,&#92;&quot;alcohol&#92;&quot;:5.824,&#92;&quot;not_distracted&#92;&quot;:21.055999999999997,&#92;&quot;no_previous&#92;&quot;:21.28,&#92;&quot;ins_premium&#92;&quot;:827.34,&#92;&quot;ins_losses&#92;&quot;:142.39,&#92;&quot;abbrev&#92;&quot;:&#92;&quot;AR&#92;&quot;},{&#92;&quot;total&#92;&quot;:12.0,&#92;&quot;speeding&#92;&quot;:4.2,&#92;&quot;alcohol&#92;&quot;:3.36,&#92;&quot;not_distracted&#92;&quot;:10.92,&#92;&quot;no_previous&#92;&quot;:10.68,&#92;&quot;ins_premium&#92;&quot;:878.41,&#92;&quot;ins_losses&#92;&quot;:165.63,&#92;&quot;abbrev&#92;&quot;:&#92;&quot;CA&#92;&quot;},{&#92;&quot;total&#92;&quot;:13.6,&#92;&quot;speeding&#92;&quot;:5.032,&#92;&quot;alcohol&#92;&quot;:3.8080000000000003,&#92;&quot;not_distracted&#92;&quot;:10.743999999999998,&#92;&quot;no_previous&#92;&quot;:12.92,&#92;&quot;ins_premium&#92;&quot;:835.5,&#92;&quot;ins_losses&#92;&quot;:139.91,&#92;&quot;abbrev&#92;&quot;:&#92;&quot;CO&#92;&quot;},{&#92;&quot;total&#92;&quot;:10.8,&#92;&quot;speeding&#92;&quot;:4.968,&#92;&quot;alcohol&#92;&quot;:3.888,&#92;&quot;not_distracted&#92;&quot;:9.396,&#92;&quot;no_previous&#92;&quot;:8.856,&#92;&quot;ins_premium&#92;&quot;:1068.73,&#92;&quot;ins_losses&#92;&quot;:167.02,&#92;&quot;abbrev&#92;&quot;:&#92;&quot;CT&#92;&quot;},{&#92;&quot;total&#92;&quot;:16.2,&#92;&quot;speeding&#92;&quot;:6.156000000000001,&#92;&quot;alcohol&#92;&quot;:4.86,&#92;&quot;not_distracted&#92;&quot;:14.094,&#92;&quot;no_previous&#92;&quot;:16.038,&#92;&quot;ins_premium&#92;&quot;:1137.87,&#92;&quot;ins_losses&#92;&quot;:151.48,&#92;&quot;abbrev&#92;&quot;:&#92;&quot;DE&#92;&quot;},{&#92;&quot;total&#92;&quot;:5.9,&#92;&quot;speeding&#92;&quot;:2.0060000000000002,&#92;&quot;alcohol&#92;&quot;:1.5930000000000002,&#92;&quot;not_distracted&#92;&quot;:5.9,&#92;&quot;no_previous&#92;&quot;:5.9,&#92;&quot;ins_premium&#92;&quot;:1273.89,&#92;&quot;ins_losses&#92;&quot;:136.05,&#92;&quot;abbrev&#92;&quot;:&#92;&quot;DC&#92;&quot;},{&#92;&quot;total&#92;&quot;:17.9,&#92;&quot;speeding&#92;&quot;:3.759,&#92;&quot;alcohol&#92;&quot;:5.190999999999999,&#92;&quot;not_distracted&#92;&quot;:16.468,&#92;&quot;no_previous&#92;&quot;:16.826,&#92;&quot;ins_premium&#92;&quot;:1160.13,&#92;&quot;ins_losses&#92;&quot;:144.18,&#92;&quot;abbrev&#92;&quot;:&#92;&quot;FL&#92;&quot;}]&quot;' data-total-rows='51' data-total-columns='8' data-max-columns='50' data-banner-text='&quot;&quot;' data-pagination='true' data-page-size='10' data-field-types='[[&quot;total&quot;,[&quot;number&quot;,&quot;float64&quot;]],[&quot;speeding&quot;,[&quot;number&quot;,&quot;float64&quot;]],[&quot;alcohol&quot;,[&quot;number&quot;,&quot;float64&quot;]],[&quot;not_distracted&quot;,[&quot;number&quot;,&quot;float64&quot;]],[&quot;no_previous&quot;,[&quot;number&quot;,&quot;float64&quot;]],[&quot;ins_premium&quot;,[&quot;number&quot;,&quot;float64&quot;]],[&quot;ins_losses&quot;,[&quot;number&quot;,&quot;float64&quot;]],[&quot;abbrev&quot;,[&quot;string&quot;,&quot;str&quot;]]]' data-show-filters='true' data-show-download='true' data-show-search='true' data-show-column-summaries='true' data-show-data-types='true' data-show-page-size-selector='true' data-show-column-explorer='true' data-show-chart-builder='true' data-row-headers='[]' data-hidden-columns='[]' data-has-stable-row-id='false' data-lazy='false' data-preload='false'></marimo-table></marimo-ui-element>"
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "CYOr",
       "code_hash": null,
       "outputs": [],
       "console": []
