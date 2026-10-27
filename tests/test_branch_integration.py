@@ -556,6 +556,68 @@ class WorkerIntegrationTests(unittest.TestCase):
                 WorkerManager(root_dir=manager_root).stop_all()
                 parent.close()
 
+    def test_run_capability_persistent_cells_and_environment_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent, notebook, _, _, _ = self._start_parent(root, "notebook")
+            manager_root = root / "cli-manager"
+            token_file = root / "parent-token"
+            token_file.write_text(parent.token + "\n", encoding="utf-8")
+            env = os.environ.copy()
+            env.pop("MARIMO_TOKEN", None)
+            env.pop("MARIMO_TOKEN_FILE", None)
+            env.update({"MARIMO_PAIR_HOME": str(manager_root), "PYTHONDONTWRITEBYTECODE": "1"})
+            script = SCRIPTS_DIR / "branch.py"
+
+            def cli(*args):
+                return subprocess.run(
+                    [sys.executable, "-B", str(script), *args], text=True, encoding="utf-8",
+                    errors="replace", capture_output=True, timeout=180, env=env,
+                )
+
+            # The branch agent's environment knows neither the registry root nor any token.
+            agent_env = {key: value for key, value in os.environ.items()
+                         if key not in {"MARIMO_TOKEN", "MARIMO_TOKEN_FILE", "MARIMO_PAIR_HOME"}}
+
+            def agent(command, *args, input_text):
+                return subprocess.run(
+                    [*command, *args], input=input_text, text=True, encoding="utf-8", errors="replace",
+                    capture_output=True, timeout=180, env=agent_env,
+                )
+
+            try:
+                started = cli("start", "--parent-url", parent.url, "--parent-notebook", str(notebook),
+                              "--token-file", str(token_file), "--names", "records", "--probe", "json")
+                self.assertEqual(started.returncode, 0, started.stderr[-2000:])
+                worker = json.loads(started.stdout)
+                self.assertEqual(worker["environment"]["modules"]["json"], "unknown")
+                self.assertIn("python", worker["environment"])
+                command = worker["run_command"]
+
+                first = agent(command, "--cell", "summary", "-", input_text="total = sum(records)\nprint(total)")
+                self.assertEqual(first.returncode, 0, first.stderr[-2000:])
+                self.assertIn("1", first.stdout)
+                # Re-running the same cell name replaces it instead of colliding with itself.
+                second = agent(command, "--cell", "summary", "-", input_text="total = sum(records) * 10")
+                self.assertEqual(second.returncode, 0, second.stderr[-2000:])
+                later = agent(command, "-", input_text="print('total is', total)")
+                self.assertEqual(later.returncode, 0, later.stderr[-2000:])
+                self.assertIn("total is 10", later.stdout)
+                # A second cell redefining the same name is rejected by the graph rules.
+                clash = agent(command, "--cell", "other", "-", input_text="total = 0")
+                self.assertNotEqual(clash.returncode, 0)
+                failing = agent(command, "--cell", "broken", "-", input_text="raise ValueError('nope')")
+                self.assertNotEqual(failing.returncode, 0)
+                self.assertIn("nope", failing.stdout + failing.stderr)
+                refused = agent(command, "stop", input_text="")
+                self.assertEqual(refused.returncode, 2)
+
+                stopped = cli("stop", "--worker", worker["worker_id"])
+                self.assertEqual(stopped.returncode, 0, stopped.stderr[-2000:])
+            finally:
+                WorkerManager(root_dir=manager_root).stop_all()
+                parent.close()
+
     def test_script_header_overrides_project_runtime_and_uses_project_root_dotenv(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -7,9 +7,11 @@ import ctypes
 import hashlib
 import ipaddress
 import json
+import keyword
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -245,6 +247,113 @@ def _without_token_sources(environ: Mapping[str, str]) -> dict[str, str]:
     env.pop("MARIMO_TOKEN", None)
     env.pop("MARIMO_TOKEN_FILE", None)
     return env
+
+
+def validate_cell_name(name: str) -> str:
+    """Accept a public identifier for a persistent worker cell; reserved prefixes are refused."""
+    if not isinstance(name, str) or not name.isidentifier() or keyword.iskeyword(name):
+        raise BranchError(f"Worker cell name must be a Python identifier: {name!r}")
+    if name.startswith("_"):
+        raise BranchError(f"Worker cell name must not start with '_': {name!r}")
+    return name
+
+
+def _persistent_cell_code(cell_name: str, source: str) -> str:
+    """Scratchpad code that creates or replaces one named worker cell, then runs it."""
+    name = validate_cell_name(cell_name)
+    return f'''import marimo._code_mode as cm
+_bp_name = {name!r}
+_bp_source = {source!r}
+async with cm.get_context() as _bp_ctx:
+    if _bp_name in _bp_ctx.cells:
+        # Reading the current code marks this version as seen, so edit_cell is not stale.
+        _bp_ctx.cells[_bp_name].code
+        _bp_ctx.edit_cell(_bp_name, code=_bp_source)
+    else:
+        _bp_ctx.create_cell(_bp_source, name=_bp_name, hide_code=False)
+    _bp_ctx.run_cell(_bp_name)
+async with cm.get_context() as _bp_ctx:
+    _bp_cell = _bp_ctx.cells[_bp_name]
+    _bp_status = str(_bp_cell.status)
+    _bp_errors = [str(_bp_error) for _bp_error in (_bp_cell.errors or [])]
+if _bp_errors or _bp_status != "idle":
+    raise RuntimeError(
+        f"worker cell {{_bp_name!r}} finished with status {{_bp_status}}: " + "; ".join(_bp_errors)
+    )
+'''
+
+
+# Modules `start` reports so a coordinator knows what branch agents can import.
+DEFAULT_PROBE_MODULES = (
+    "numpy", "pandas", "polars", "scipy", "statsmodels", "sklearn",
+    "matplotlib", "altair", "plotly", "torch",
+)
+_MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+
+
+def _environment_probe_code(modules: Sequence[str]) -> str:
+    """Worker code reporting the Python version and each module's installed version.
+
+    Modules are located with find_spec and never imported, so probing is cheap.
+    A found module without distribution metadata reports "unknown"; a missing one null.
+    """
+    for module in modules:
+        if not isinstance(module, str) or not _MODULE_NAME.fullmatch(module):
+            raise BranchError(f"Invalid module name to probe: {module!r}")
+    return f'''import importlib.metadata as _bp_metadata
+import importlib.util as _bp_util
+import json as _bp_json
+import platform as _bp_platform
+_bp_distributions = _bp_metadata.packages_distributions()
+_bp_modules = {{}}
+for _bp_module in {list(modules)!r}:
+    try:
+        _bp_found = _bp_util.find_spec(_bp_module) is not None
+    except (ImportError, ValueError):
+        _bp_found = False
+    _bp_version = None
+    if _bp_found:
+        _bp_version = "unknown"
+        _bp_top = _bp_module.partition(".")[0]
+        for _bp_dist in _bp_distributions.get(_bp_top, []):
+            try:
+                _bp_version = _bp_metadata.version(_bp_dist)
+                break
+            except _bp_metadata.PackageNotFoundError:
+                continue
+    _bp_modules[_bp_module] = _bp_version
+print("MARIMO_PAIR_ENVIRONMENT:" + _bp_json.dumps({{"python": _bp_platform.python_version(), "modules": _bp_modules}}))
+'''
+
+
+def build_run_capability(python: str, script: Path, root: Path, worker_id: str) -> str:
+    """A Bash launcher that can only run code in one worker; hand this, not branch.py, to agents.
+
+    It prevents misrouting to other workers, coordinator commands, or the parent.
+    It is not a sandbox: code it runs executes as the same OS user.
+    """
+    if not re.fullmatch(r"[0-9a-f]{32}", worker_id):
+        raise BranchError(f"Invalid worker ID: {worker_id!r}")
+    temp = shlex.quote(tempfile.gettempdir())
+    command = f"{shlex.quote(python)} -B {shlex.quote(str(script))} run --worker {worker_id}"
+    return f'''#!/usr/bin/env bash
+# Run-only capability for marimo-pair branch worker {worker_id}.
+# Prevents misrouting to other workers or the parent; it is not a sandbox.
+set -euo pipefail
+unset MARIMO_TOKEN MARIMO_TOKEN_FILE
+export MARIMO_PAIR_HOME={shlex.quote(str(root))}
+export TMPDIR={temp} TMP={temp} TEMP={temp}
+usage() {{
+  echo "usage: run -   |   run --cell NAME -   (worker code on stdin)" >&2
+  exit 2
+}}
+if [[ $# -eq 1 && "$1" == "-" ]]; then
+  exec {command} -
+elif [[ $# -eq 3 && "$1" == "--cell" && "$3" == "-" ]]; then
+  exec {command} --cell "$2" -
+fi
+usage
+'''
 
 
 def _per_user_root() -> Path:
@@ -1082,6 +1191,7 @@ class WorkerManager:
                 # Later `add` batches use each worker's own private paths.
                 record.bundle_path = record.temp_dir / "values.pickle"
                 record.runtime_path = record.temp_dir / "runtime.json"
+                self._write_run_capability(record)
                 record.status = "running"
                 self._write_record(record)
             return records
@@ -1597,6 +1707,40 @@ async with cm.get_context() as _bp_cleanup_ctx:
             raise BranchError(f"Worker {worker_id} is not ready for execution (status={selected.status})")
         return self._execute_record(selected, code, validate=True)
 
+    def execute_cell(self, worker_id: str, cell_name: str, code: str) -> ExecutionResult:
+        """Create or replace one named cell in a worker and run it, so its definitions persist."""
+        return self.execute(worker_id, _persistent_cell_code(cell_name, code))
+
+    def describe_environment(self, record: WorkerRecord, extra_modules: Sequence[str] = ()) -> dict[str, Any]:
+        """Report the worker's Python version and which analysis modules it can import.
+
+        Never raises for a failed probe: startup has already succeeded, so the
+        report carries an "error" entry instead.
+        """
+        modules = list(dict.fromkeys((*DEFAULT_PROBE_MODULES, *extra_modules)))
+        result = self._execute_record(record, _environment_probe_code(modules), validate=True)
+        marker = next(
+            (line for line in result.output.splitlines() if line.startswith("MARIMO_PAIR_ENVIRONMENT:")), None,
+        )
+        if not result.success or marker is None:
+            detail = (result.stderr or result.output or "no report").strip()[-500:]
+            return {"error": f"environment probe failed: {detail}"}
+        try:
+            return json.loads(marker.partition(":")[2])
+        except ValueError:
+            return {"error": "environment probe returned invalid JSON"}
+
+    @staticmethod
+    def run_capability_path(record: WorkerRecord) -> Path:
+        return record.temp_dir / "run"
+
+    def _write_run_capability(self, record: WorkerRecord) -> None:
+        path = self.run_capability_path(record)
+        text = build_run_capability(sys.executable, Path(__file__).resolve(), self.root_dir, record.worker_id)
+        _write_private(path, text)
+        if os.name != "nt":
+            path.chmod(0o700)
+
     def _wait_for_server_exit(self, record: WorkerRecord, timeout: float | None = None) -> bool:
         if record.server_pid is None:
             return True
@@ -1791,12 +1935,19 @@ def _worker_count(value: str) -> int:
     return count
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Coordinator CLI; the run subcommand accepts only a worker ID and stdin."""
+_TOKEN_EPILOG = (
+    "Coordinator-only. Parent token: --token-file, else $MARIMO_TOKEN_FILE, else $MARIMO_TOKEN. "
+    "Never give branch agents this command, the parent token, or its token file."
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage local marimo-pair branch workers")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    start = subparsers.add_parser("start", help="start a worker from named parent values")
+    start = subparsers.add_parser(
+        "start", help="[coordinator] start workers from named parent values", epilog=_TOKEN_EPILOG,
+    )
     start.add_argument(
         "--parent-url", required=True,
         help="loopback URL of the token-protected parent server, e.g. http://localhost:2718",
@@ -1815,8 +1966,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--count", type=_worker_count,
         help=f"start N workers from one export of the parent (1-{MAX_WORKERS_PER_START}); prints a JSON list",
     )
+    start.add_argument(
+        "--probe", nargs="+", default=[], metavar="MODULE",
+        help="extra modules to report in the output's environment (in addition to common analysis packages)",
+    )
 
-    add = subparsers.add_parser("add", help="coordinator-only named export to a worker")
+    add = subparsers.add_parser(
+        "add", help="[coordinator] export more named parent values to a worker", epilog=_TOKEN_EPILOG,
+    )
     add.add_argument("--worker", required=True, help="worker ID printed by start")
     add.add_argument(
         "--parent-session",
@@ -1828,14 +1985,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="file holding the parent token (default: $MARIMO_TOKEN_FILE, then $MARIMO_TOKEN)",
     )
 
-    run = subparsers.add_parser("run", help="execute stdin code in one explicit worker")
+    run = subparsers.add_parser(
+        "run", help="[branch agent] execute stdin code in one explicit worker",
+        epilog=(
+            "Branch agent command; needs no parent token. Prefer the worker's run_command "
+            "(printed by start), which can only run code in that one worker."
+        ),
+    )
     run.add_argument("--worker", required=True, help="worker ID; code is read from stdin")
+    run.add_argument(
+        "--cell", metavar="NAME",
+        help="create or replace the worker cell NAME with this code and run it, so its definitions persist",
+    )
     run.add_argument("source", choices=["-"], help="'-' to read code from stdin")
 
-    subparsers.add_parser("list", help="list coordinator-owned workers")
-    stop = subparsers.add_parser("stop", help="stop one worker")
+    subparsers.add_parser(
+        "list", help="[coordinator] list workers", epilog="Coordinator-only; prints worker records as JSON.",
+    )
+    stop = subparsers.add_parser(
+        "stop", help="[coordinator] stop one worker", epilog="Coordinator-only; shuts the worker down and deletes its files.",
+    )
     stop.add_argument("--worker", required=True, help="worker ID to stop")
+    return parser
 
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Coordinator CLI; the run subcommand accepts only a worker ID and stdin."""
+    parser = build_parser()
     args = parser.parse_args(argv)
     manager = WorkerManager()
     manager.parent_token_file = getattr(args, "token_file", None)
@@ -1862,6 +2038,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "Worker startup requires a process-local SSE drainer; use a persistent coordinator "
                     "instead of the short-lived start CLI"
                 )
+            # Workers share the parent's Python environment, so one probe describes all of them.
+            environment = manager.describe_environment(records[0], args.probe)
             started = [
                 {
                     "worker_id": record.worker_id,
@@ -1869,6 +2047,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "session_id": record.session_id,
                     "status": record.status,
                     "parent_session": parent.session_id,
+                    "run_command": ["bash", str(manager.run_capability_path(record))],
+                    "environment": environment,
                 }
                 for record in records
             ]
@@ -1884,7 +2064,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             manager.execution_timeout = None
             stdin_buffer = getattr(sys.stdin, "buffer", None)
             code = stdin_buffer.read().decode("utf-8") if stdin_buffer is not None else sys.stdin.read()
-            result = manager.execute(args.worker, code)
+            if args.cell is not None:
+                result = manager.execute_cell(args.worker, args.cell, code)
+            else:
+                result = manager.execute(args.worker, code)
             if result.output:
                 _write_cli_text(sys.stdout, result.output + ("" if result.output.endswith("\n") else "\n"))
             if result.stderr:
@@ -1898,6 +2081,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "session_id": record.session_id,
                     "status": record.status,
                     "imported_names": list(record.imported_names),
+                    "run_command": ["bash", str(manager.run_capability_path(record))],
                 }
                 for record in manager.list_workers()
             ]))
@@ -1911,7 +2095,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "BranchError", "ExecutionResult", "ParentTarget", "SSEEvent", "WorkerManager",
-    "WorkerRecord", "main", "parse_sse_records", "preflight_bash", "process_identity",
+    "WorkerRecord", "build_parser", "build_run_capability", "main", "parse_sse_records", "preflight_bash", "process_identity",
     "process_matches", "redact_log_text", "resolve_bash", "wait_for_kernel_ready",
     "wait_for_process",
 ]

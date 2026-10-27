@@ -1230,6 +1230,10 @@ class StartWorkersTests(unittest.TestCase):
             stored = self.manager.get_worker(record.worker_id)
             self.assertEqual(stored.bundle_path, record.bundle_path)
             self.assertEqual(stored.status, "running")
+            capability = self.manager.run_capability_path(record)
+            self.assertIn(f"--worker {record.worker_id}", capability.read_text(encoding="utf-8"))
+            if os.name != "nt":
+                self.assertEqual(capability.stat().st_mode & 0o777, 0o700)
 
     def test_failure_on_a_later_worker_stops_every_earlier_worker(self):
         def launch(record, runtime):
@@ -1294,7 +1298,10 @@ class StartWorkersTests(unittest.TestCase):
 
     def test_cli_prints_an_object_without_count_and_a_list_with_count(self):
         records = [
-            mock.Mock(worker_id=str(i) * 32, url=f"http://127.0.0.1:{4000 + i}", session_id=f"w{i}", status="running")
+            mock.Mock(
+                worker_id=str(i) * 32, url=f"http://127.0.0.1:{4000 + i}", session_id=f"w{i}", status="running",
+                temp_dir=Path(f"/tmp/worker-{i}"),
+            )
             for i in range(2)
         ]
         parent = ParentTarget("http://127.0.0.1:2718", "s_parent", Path("parent.py"))
@@ -1308,7 +1315,9 @@ class StartWorkersTests(unittest.TestCase):
                 branch.WorkerManager, "__init__", autospec=True, side_effect=initialize
             ), mock.patch.object(branch.WorkerManager, "resolve_parent", return_value=parent), mock.patch.object(
                 branch.WorkerManager, "start_workers", side_effect=lambda p, n, c: records[:c]
-            ) as start, mock.patch.object(branch.sys, "stdout", stdout):
+            ) as start, mock.patch.object(
+                branch.WorkerManager, "describe_environment", return_value={"python": "3.13.1", "modules": {}}
+            ), mock.patch.object(branch.sys, "stdout", stdout):
                 self.assertEqual(branch.main([
                     "start", "--parent-url", "http://127.0.0.1:2718", "--names", "records", *argv,
                 ]), 0)
@@ -1328,6 +1337,201 @@ class StartWorkersTests(unittest.TestCase):
                 branch.main([
                     "start", "--parent-url", "http://127.0.0.1:2718", "--names", "records", "--count", value,
                 ])
+
+
+
+REPO_DOCS = Path(__file__).parents[1] / "skills" / "marimo-pair"
+
+
+class PersistentCellTests(unittest.TestCase):
+    def test_cell_names_must_be_plain_public_identifiers(self):
+        self.assertEqual(branch.validate_cell_name("analysis_1"), "analysis_1")
+        for name in ("", "1x", "has space", "class", "_private", "_bp_bootstrap", "_marimo_pair_x"):
+            with self.subTest(name=name), self.assertRaises(BranchError):
+                branch.validate_cell_name(name)
+
+    def test_generated_code_creates_or_edits_the_named_cell_and_compiles(self):
+        import ast
+        source = "total = sum(records)\nprint('naïve', total)\n"
+        code = branch._persistent_cell_code("analysis", source)
+        compile(code, "<cell>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        self.assertIn(repr(source), code)
+        self.assertIn("create_cell(", code)
+        self.assertIn("edit_cell(", code)
+        self.assertIn("run_cell(", code)
+        self.assertIn("hide_code=False", code)
+
+    def test_execute_cell_validates_the_name_and_routes_to_one_worker(self):
+        manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
+        self.addCleanup(shutil.rmtree, manager.root_dir, True)
+        result = branch.ExecutionResult(True, "ok", "", 0)
+        with mock.patch.object(manager, "execute", return_value=result) as execute:
+            self.assertIs(manager.execute_cell("a" * 32, "analysis", "x = 1"), result)
+            with self.assertRaises(BranchError):
+                manager.execute_cell("a" * 32, "_bp_x", "x = 1")
+        execute.assert_called_once()
+        self.assertEqual(execute.call_args.args[0], "a" * 32)
+        self.assertEqual(execute.call_args.args[1], branch._persistent_cell_code("analysis", "x = 1"))
+
+    def test_run_cli_routes_cell_mode_to_execute_cell(self):
+        source = "x = 1"
+        stdin = mock.Mock(read=mock.Mock(return_value=source), buffer=None)
+        done = branch.ExecutionResult(True, "done", "", 0)
+        with mock.patch.object(branch.WorkerManager, "execute_cell", return_value=done) as execute_cell, \
+                mock.patch.object(branch.WorkerManager, "execute") as execute, \
+                mock.patch.object(branch.sys, "stdin", stdin), mock.patch.object(branch.sys, "stdout", io.StringIO()):
+            self.assertEqual(branch.main(["run", "--worker", "d" * 32, "--cell", "analysis", "-"]), 0)
+        execute_cell.assert_called_once_with("d" * 32, "analysis", source)
+        execute.assert_not_called()
+
+
+class RunCapabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.argv_log = self.directory / "argv.log"
+        self.fake_python = self.directory / "fake-python"
+        self.fake_python.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf "%s\\n" "$@" > "$ARGV_LOG"\n'
+            'printf "TOKEN=%s\\nTOKEN_FILE=%s\\nHOME_DIR=%s\\n" "${MARIMO_TOKEN-unset}" '
+            '"${MARIMO_TOKEN_FILE-unset}" "${MARIMO_PAIR_HOME-unset}" >> "$ARGV_LOG"\n',
+            encoding="utf-8",
+        )
+        self.fake_python.chmod(0o755)
+        self.capability = self.directory / "run"
+        self.capability.write_text(branch.build_run_capability(
+            str(self.fake_python), Path("/opt/branch.py"), self.directory / "home", "b" * 32,
+        ), encoding="utf-8")
+
+    def _invoke(self, *args):
+        env = os.environ.copy()
+        env.update({"ARGV_LOG": str(self.argv_log), "MARIMO_TOKEN": "parent-secret", "MARIMO_TOKEN_FILE": "/x"})
+        return subprocess_run(["bash", str(self.capability), *args], env)
+
+    def test_capability_runs_only_its_worker_without_parent_tokens(self):
+        completed = self._invoke("-")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        lines = self.argv_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[:6], ["-B", "/opt/branch.py", "run", "--worker", "b" * 32, "-"])
+        self.assertIn("TOKEN=unset", lines)
+        self.assertIn("TOKEN_FILE=unset", lines)
+        self.assertIn(f"HOME_DIR={self.directory / 'home'}", lines)
+
+    def test_capability_supports_cell_mode(self):
+        completed = self._invoke("--cell", "analysis", "-")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        lines = self.argv_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[:8], ["-B", "/opt/branch.py", "run", "--worker", "b" * 32, "--cell", "analysis", "-"])
+
+    def test_capability_rejects_every_other_command_shape(self):
+        for args in ([], ["stop"], ["--worker", "c" * 32, "-"], ["--cell", "x"], ["-", "extra"], ["--cell", "x", "y"]):
+            with self.subTest(args=args):
+                completed = self._invoke(*args)
+                self.assertEqual(completed.returncode, 2)
+                self.assertIn("usage", completed.stderr.lower())
+        self.assertFalse(self.argv_log.exists())
+
+
+def subprocess_run(command, env):
+    import subprocess
+    return subprocess.run(command, env=env, capture_output=True, text=True, timeout=30)
+
+
+class EnvironmentProbeTests(unittest.TestCase):
+    def test_probe_code_reports_python_and_module_versions(self):
+        code = branch._environment_probe_code(["json", "definitely_missing_module_xyz", "unittest.mock"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exec(compile(code, "<probe>", "exec"), {})
+        marker = next(line for line in out.getvalue().splitlines() if line.startswith("MARIMO_PAIR_ENVIRONMENT:"))
+        report = json.loads(marker.partition(":")[2])
+        self.assertEqual(report["python"], platform.python_version())
+        self.assertEqual(report["modules"]["json"], "unknown")
+        self.assertIsNone(report["modules"]["definitely_missing_module_xyz"])
+        self.assertEqual(report["modules"]["unittest.mock"], "unknown")
+
+    def test_describe_environment_parses_the_worker_report(self):
+        manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
+        self.addCleanup(shutil.rmtree, manager.root_dir, True)
+        record = mock.Mock(worker_id="a" * 32)
+        output = 'noise\nMARIMO_PAIR_ENVIRONMENT:{"python": "3.13.1", "modules": {"numpy": "2.1.0"}}\n'
+        with mock.patch.object(manager, "_execute_record", return_value=branch.ExecutionResult(True, output)) as run:
+            report = manager.describe_environment(record, ["polars"])
+        self.assertEqual(report, {"python": "3.13.1", "modules": {"numpy": "2.1.0"}})
+        probed = run.call_args.args[1]
+        for module in (*branch.DEFAULT_PROBE_MODULES, "polars"):
+            self.assertIn(repr(module), probed)
+
+    def test_describe_environment_reports_failures_instead_of_raising(self):
+        manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
+        self.addCleanup(shutil.rmtree, manager.root_dir, True)
+        with mock.patch.object(manager, "_execute_record", return_value=branch.ExecutionResult(False, "", "boom", 1)):
+            report = manager.describe_environment(mock.Mock(worker_id="a" * 32))
+        self.assertIn("boom", report["error"])
+
+    def test_probe_module_names_are_validated(self):
+        for name in ("os; import sys", "", "1abc", "a..b"):
+            with self.subTest(name=name), self.assertRaises(BranchError):
+                branch._environment_probe_code([name])
+
+
+class StartOutputTests(unittest.TestCase):
+    def test_start_prints_run_capability_and_environment(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        records = [_record(directory / str(i), worker_id=str(i) * 32) for i in range(2)]
+        parent = ParentTarget("http://127.0.0.1:2718", "s_parent", Path("parent.py"))
+        environment = {"python": "3.13.1", "modules": {"numpy": "2.1.0"}}
+
+        def initialize(manager, *args, **kwargs):
+            manager._drainers = {}
+            manager.root_dir = directory
+
+        stdout = io.StringIO()
+        with mock.patch.object(branch.WorkerManager, "__init__", autospec=True, side_effect=initialize), \
+                mock.patch.object(branch.WorkerManager, "resolve_parent", return_value=parent), \
+                mock.patch.object(branch.WorkerManager, "start_workers", return_value=records), \
+                mock.patch.object(branch.WorkerManager, "describe_environment", return_value=environment) as describe, \
+                mock.patch.object(branch.sys, "stdout", stdout):
+            self.assertEqual(branch.main([
+                "start", "--parent-url", "http://127.0.0.1:2718", "--names", "records", "--count", "2",
+                "--probe", "polars", "duckdb",
+            ]), 0)
+        describe.assert_called_once_with(records[0], ["polars", "duckdb"])
+        printed = json.loads(stdout.getvalue())
+        for item, record in zip(printed, records):
+            self.assertEqual(item["environment"], environment)
+            self.assertEqual(item["run_command"], ["bash", str(record.temp_dir / "run")])
+
+
+class CliHelpTests(unittest.TestCase):
+    def _subparsers(self):
+        parser = branch.build_parser()
+        action = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
+        return action.choices
+
+    def test_every_subcommand_states_its_role_and_token_needs(self):
+        commands = self._subparsers()
+        self.assertEqual(set(commands), {"start", "add", "run", "list", "stop"})
+        for name in ("start", "add", "list", "stop"):
+            self.assertIn("coordinator-only", commands[name].epilog.lower())
+        for name in ("start", "add"):
+            self.assertIn("MARIMO_TOKEN_FILE", commands[name].epilog)
+        self.assertIn("branch agent", commands["run"].epilog.lower())
+        self.assertIn("no parent token", commands["run"].epilog.lower())
+
+    def test_every_option_has_help_and_is_documented(self):
+        docs = (REPO_DOCS / "SKILL.md").read_text(encoding="utf-8") + (
+            REPO_DOCS / "reference" / "execution-context.md").read_text(encoding="utf-8")
+        for name, subparser in self._subparsers().items():
+            for action in subparser._actions:
+                for option in action.option_strings:
+                    if option in ("-h", "--help"):
+                        continue
+                    with self.subTest(command=name, option=option):
+                        self.assertTrue(action.help, f"{name} {option} has no help")
+                        self.assertTrue(option in docs, f"{name} {option} is not documented")
 
 
 if __name__ == "__main__":
