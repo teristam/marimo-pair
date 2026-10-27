@@ -98,7 +98,10 @@ else
     fi
     # $(<file) is read by the shell itself, so no process argv sees the token.
     token=$(<"$token_file")
-    token="${token%$'\r'}"
+    # Strip any trailing run of CR/LF (matches branch.py's rstrip("\r\n")).
+    while [[ "$token" == *[$'\r\n'] ]]; do
+      token="${token%?}"
+    done
     if [[ -z "$token" ]]; then
       echo "Token file is empty: ${token_file}" >&2
       exit 1
@@ -182,7 +185,17 @@ if [[ -n "$token" ]]; then
   trap 'exit 143' TERM
   auth_header_file=$(umask 077 && mktemp "${TMPDIR:-/tmp}/marimo-pair-auth.XXXXXX")
   printf 'Authorization: Bearer %s\n' "$token" > "$auth_header_file"
-  auth_args+=(-H "@${auth_header_file}")
+  # Git Bash passes "@/tmp/x" through unconverted, and a native curl.exe cannot
+  # open that; hand it the Windows spelling of the path instead.
+  auth_header_arg="$auth_header_file"
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      if command -v cygpath >/dev/null 2>&1; then
+        auth_header_arg=$(cygpath -m "$auth_header_file")
+      fi
+      ;;
+  esac
+  auth_args+=(-H "@${auth_header_arg}")
 fi
 
 # Resolve session ID. A file key is stable across browser reconnects, while a

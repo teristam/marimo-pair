@@ -70,6 +70,23 @@ for arg in "$@"; do printf '%s\\n' "$arg" >> "$CURL_ARGV_LOG"; done
 exec "$REAL_CURL" "$@"
 """
 
+UNAME_SHIM = """#!/usr/bin/env bash
+if [[ -n "${FAKE_UNAME:-}" && "${1:-}" == "-s" ]]; then
+  echo "$FAKE_UNAME"
+  exit 0
+fi
+exec "$REAL_UNAME" "$@"
+"""
+
+# Stands in for MSYS cygpath: logs the call and returns a recognisable
+# alternate spelling (a symlink) of the path it was given.
+CYGPATH_SHIM = """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$CYGPATH_LOG"
+link="$CYGPATH_LINK_DIR/converted-$(basename "$2")"
+ln -s "$2" "$link"
+printf '%s\\n' "$link"
+"""
+
 
 @unittest.skipUnless(shutil.which("bash") and shutil.which("jq") and shutil.which("curl"), "requires Bash, jq and curl")
 class ExecuteCodeTransportTests(unittest.TestCase):
@@ -84,6 +101,12 @@ class ExecuteCodeTransportTests(unittest.TestCase):
         shim = cls.shim_dir / "curl"
         shim.write_text(CURL_SHIM, encoding="utf-8")
         shim.chmod(0o755)
+        # cygpath and uname shims live apart so they only apply when requested.
+        cls.msys_dir = Path(tempfile.mkdtemp())
+        for name, text in (("uname", UNAME_SHIM), ("cygpath", CYGPATH_SHIM)):
+            path = cls.msys_dir / name
+            path.write_text(text, encoding="utf-8")
+            path.chmod(0o755)
 
     @classmethod
     def tearDownClass(cls):
@@ -91,6 +114,7 @@ class ExecuteCodeTransportTests(unittest.TestCase):
         cls.server.server_close()
         cls.thread.join(timeout=2)
         shutil.rmtree(cls.shim_dir, ignore_errors=True)
+        shutil.rmtree(cls.msys_dir, ignore_errors=True)
 
     def setUp(self):
         _FixtureHandler.bodies = []
@@ -276,6 +300,40 @@ class ExecuteCodeTransportTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr[-1000:])
         self.assertNotIn("Authorization", _FixtureHandler.headers[-1])
         self.assertEqual(self._header_files(), [])
+
+    def test_msys_header_path_goes_through_cygpath_only_there(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "cygpath.log"
+            msys = {
+                "PATH": f"{self.msys_dir}{os.pathsep}{self.shim_dir}{os.pathsep}{os.environ['PATH']}",
+                "FAKE_UNAME": "MINGW64_NT-10.0-19045", "REAL_UNAME": shutil.which("uname"),
+                "CYGPATH_LOG": str(log), "CYGPATH_LINK_DIR": directory,
+            }
+            # Without a MINGW/MSYS/CYGWIN uname the cygpath on PATH is never consulted.
+            plain = dict(msys, FAKE_UNAME="")
+            completed = self._run(["--session", "s", "-c", "pass"], env=plain)
+            self.assertEqual(completed.returncode, 0, completed.stderr[-1000:])
+            self.assertFalse(log.exists())
+            self.assertTrue(all(not Path(p).name.startswith("converted-") for p in self._header_files()))
+
+            self.argv_log.write_text("", encoding="utf-8")
+            completed = self._run(["--session", "s", "-c", "pass"], env=msys)
+            self.assertEqual(completed.returncode, 0, completed.stderr[-1000:])
+            self.assertEqual(_FixtureHandler.headers[-1]["Authorization"], "Bearer fixture-secret")
+            header_files = self._header_files()
+            self.assertEqual(len(header_files), 1)
+            self.assertEqual(Path(header_files[0]).parent, Path(directory))
+            self.assertTrue(Path(header_files[0]).name.startswith("converted-marimo-pair-auth."))
+            self.assertIn("-m ", log.read_text(encoding="utf-8"))
+
+    def test_token_file_trailing_cr_lf_runs_are_stripped_like_python(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "token"
+            path.write_bytes(b"crlf-secret\r\n\r\n")
+            self.assertEqual(branch.parent_token(str(path)), "crlf-secret")
+            completed = self._run(["--token-file", str(path), "--session", "s", "-c", "pass"])
+            self.assertEqual(completed.returncode, 0, completed.stderr[-1000:])
+            self.assertEqual(_FixtureHandler.headers[-1]["Authorization"], "Bearer crlf-secret")
 
     def test_old_curl_is_refused_only_when_a_token_is_needed(self):
         old = {"FAKE_CURL_VERSION": "7.54.1"}
