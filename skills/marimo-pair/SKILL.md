@@ -94,17 +94,33 @@ python /absolute/path/to/marimo-pair/scripts/branch.py start \
 `--count N` (1-16) prints a JSON list of workers sharing one snapshot; startup
 is all-or-nothing. Once started, workers fail independently.
 
+Each started worker reports:
+- `run_command`: a launcher that can only run code in that one worker
+- `environment`: the Python version, plus the installed version (or `null`) of
+  common analysis packages, which tells you what branch agents can import
+  without installing anything. Add more modules with `--probe MODULE ...`.
+
 Use `python3` instead of `python` where that is the available interpreter. The
-coordinator retains the returned `worker_id` and hands the agent only a
-worker-specific run capability. Worker code is sent on stdin, never routed by
-discovery or an arbitrary URL:
+coordinator retains the returned `worker_id` and hands each agent only its
+`run_command`. Worker code is sent on stdin, never routed by discovery or an
+arbitrary URL:
 
 ```bash
-python /absolute/path/to/marimo-pair/scripts/branch.py run \
-  --worker WORKER_ID - <<'PY'
+bash /tmp/marimo-pair-.../temp/WORKER_ID/run - <<'PY'
 print(records[:3])
 PY
 ```
+
+A plain run is a scratchpad: new top-level names are discarded afterwards. To
+keep results between calls, pass `--cell NAME`. It creates the worker cell
+`NAME`, or replaces it on later calls, runs it, and keeps its definitions for
+later runs. marimo's graph rules apply: each name is defined by one cell, so
+redefine a name by re-running the same `--cell NAME`. A failing cell makes the
+command exit nonzero. `branch.py run --worker WORKER_ID [--cell NAME] -` is the
+same operation without the launcher.
+
+Branch agents follow [branch-agents.md](reference/branch-agents.md), which has
+a prompt template and the rules for combining branching with other skills.
 
 The coordinator alone may inspect `branch.py list`, request additional values,
 and stop workers:
@@ -117,8 +133,8 @@ python /absolute/path/to/marimo-pair/scripts/branch.py stop --worker WORKER_ID
 ```
 
 For each later batch, the branch agent sends the coordinator a **names-only**
-request; it must not invoke `add`. The coordinator runs `add`, which resolves the parent's current session for the
-worker's notebook and revalidates it.
+request; it must not invoke `add`. The coordinator runs `add`, which resolves
+the parent's current session for the worker's notebook and revalidates it.
 Every batch is a snapshot of the parent's current state; keep the parent idle
 while exporting, because serialization hooks may run user code. Batch aliases
 are retained only within a single batch. Reject collisions with names already
@@ -127,19 +143,23 @@ values. Restore rollback is attempted. If an error reports rollback failure, sto
 that worker rather than continuing with uncertain state; earlier cells remain
 usable when rollback succeeds.
 
-Branch agents receive only `branch.py run --worker WORKER_ID -` (or an
-equivalent harness-scoped worker capability) and may ask the coordinator for
-more names. Never give them `add`, `start`, `list`, `stop`, parent URL/session,
-parent token, parent token file, `execute-code.sh`, or server-discovery access. The shared
+Branch agents receive only their worker's `run_command`, and may ask the
+coordinator for more names. Grant it per agent in the harness, e.g.
+`Bash(bash /tmp/marimo-pair-.../temp/WORKER_ID/run *)`. The launcher accepts only
+`-` or `--cell NAME -`, runs nothing but `run` for that worker, and drops
+`MARIMO_TOKEN`/`MARIMO_TOKEN_FILE`. Never give agents `branch.py` itself,
+`add`, `start`, `list`, `stop`, the parent URL/session, the parent token or its
+token file, `execute-code.sh`, or server-discovery access. The shared
 `allowed-tools` list is not per-agent isolation: harness grants and handoff
-must withhold those broader capabilities and scope run access to that worker.
+must withhold those broader capabilities.
 This only prevents accidental misrouting and keeps credentials out of agent
 prompts/environments; it is **not a sandbox**. Worker code is arbitrary code
 running as the same OS user and can read the shared registry/other worker token
 files, dotenv-derived values loaded into its environment, and potentially the
-parent token while it is held by the coordinator's child processes during export. Use a separate OS account
-or container for actual containment. Do not pass the parent token, its token
-file, or MARIMO_TOKEN/MARIMO_TOKEN_FILE into a branch agent's environment.
+parent token while the coordinator's child processes hold it during export.
+Use a separate OS account or container for actual containment. Do not pass the
+parent token, its token file, or `MARIMO_TOKEN`/`MARIMO_TOKEN_FILE` into a
+branch agent's environment.
 
 Workers use separate temporary notebooks and kernels; they do not copy the
 parent graph or rerun preprocessing. They still share the parent's Python
@@ -414,6 +434,7 @@ For designing custom visual or interactive output, see
 ## References
 
 - [execution-context.md](reference/execution-context.md) — scripts, MCP, auth, startup, and shell quoting
+- [branch-agents.md](reference/branch-agents.md) — branch-agent prompt template and combining branching with other skills
 - [finding-marimo.md](reference/finding-marimo.md) — choosing the right marimo invocation
 - [gotchas.md](reference/gotchas.md) — name redefinition, cached module proxies, and notebook traps
 - [rich-representations.md](reference/rich-representations.md) — custom widgets and visualizations

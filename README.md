@@ -89,17 +89,26 @@ python /absolute/path/to/marimo-pair/scripts/branch.py start \
 ```
 
 `--count` prints a JSON list of workers sharing one snapshot; startup is
-all-or-nothing.
+all-or-nothing. Each worker's entry includes:
+- `run_command`: a launcher that can only run code in that worker
+- `environment`: the Python version and installed analysis packages, which
+  tells you what agents can import. Add more modules with `--probe MODULE ...`.
 
-Give a branch agent only its worker ID and a harness-scoped ability to run
-against that ID. Worker code goes on stdin and never selects a server from
-global discovery:
+Give a branch agent only its worker's `run_command`. Worker code goes on stdin
+and never selects a server from global discovery:
 
 ```bash
-python /absolute/path/to/marimo-pair/scripts/branch.py run --worker "$WORKER_ID" - <<'PY'
+bash "$RUN_COMMAND" - <<'PY'
 print(records[:3])
 PY
+# Keep results between runs in a named worker cell (re-running NAME replaces it):
+bash "$RUN_COMMAND" --cell summary - <<'PY'
+total = sum(records)
+PY
 ```
+
+See `skills/marimo-pair/reference/branch-agents.md` for a branch-agent prompt
+template and how branching combines with other analysis skills.
 
 If the agent needs another parent value, it sends the coordinator **names only**.
 The coordinator runs `add`, which finds the parent's current session itself;
@@ -146,8 +155,9 @@ paths to the scripts from the installed skill and add them to your
 ```
 
 Those broad permissions are for ordinary coordinator pairing, **not** branch
-agents. Grant branch agents only their specific worker's `branch.py run`
-capability; don't globally allow `branch.py *` on their behalf.
+agents. Grant each branch agent only its own worker's launcher, e.g.
+`Bash(bash /tmp/marimo-pair-.../temp/WORKER_ID/run *)`. Don't globally allow
+`branch.py *` on their behalf.
 
 ## Contributing
 

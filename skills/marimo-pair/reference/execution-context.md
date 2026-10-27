@@ -108,21 +108,40 @@ the parent graph.
 ### Role boundary and commands
 
 The coordinator owns parent credentials and runs `start`, `list`, `add`, and
-`stop`. It hands each branch agent only a worker-specific capability to run
-code for the selected worker, for example:
+`stop`. Each `start` (and `list`) entry carries a `run_command`: a launcher in
+the worker's private directory that can only run code in that worker. Hand
+each branch agent only its own `run_command`:
 
 ```bash
-python /absolute/path/to/marimo-pair/scripts/branch.py run --worker WORKER_ID - <<'PY'
+bash /tmp/marimo-pair-.../temp/WORKER_ID/run - <<'PY'
 print(records[:3])
 PY
 ```
 
-The run command accepts source only on stdin and routes by worker ID to the
-recorded worker URL/session with its worker token. The coordinator already ran
-`help(cm)` for this worker; the branch agent does not use discovery or direct
-`execute-code.sh`. A branch agent needing more
-values sends a names-only request to the coordinator; the coordinator runs `add`, which finds the parent's **current** session for the
-worker's notebook itself (browser reconnects rename sessions):
+The launcher accepts exactly `-` or `--cell NAME -`, removes `MARIMO_TOKEN`
+and `MARIMO_TOKEN_FILE`, and pins the registry location, so it works even when
+the agent's environment sets a different `TMPDIR`. Grant it per agent, e.g.
+`Bash(bash /tmp/marimo-pair-.../temp/WORKER_ID/run *)`. It prevents misrouting;
+it is not a sandbox. Underneath it runs
+`branch.py run --worker WORKER_ID [--cell NAME] -`, which reads source only
+from stdin and routes by worker ID to the recorded worker URL/session with its
+worker token. The coordinator already ran `help(cm)` for this worker; the
+branch agent does not use discovery or direct `execute-code.sh`.
+
+`run --cell NAME` creates the worker cell `NAME`, or replaces it on later
+calls, and runs it. Its definitions then persist for later runs, which a plain
+scratchpad run does not do. Graph rules apply: another cell cannot redefine
+its names. A cell that errors makes the command exit nonzero.
+
+`start` also prints `environment`: the worker's Python version and, for common
+analysis packages, the installed version, `"unknown"` (found but no version
+metadata) or `null` (missing). Workers share the parent's environment, so one
+probe describes all of them. Add modules with `--probe MODULE ...`. A probe
+failure is reported in `environment.error` and does not fail `start`.
+
+A branch agent needing more values sends a names-only request to the
+coordinator. The coordinator runs `add`, which finds the parent's **current**
+session for the worker's notebook itself (browser reconnects rename sessions):
 
 ```bash
 python /absolute/path/to/marimo-pair/scripts/branch.py add \
