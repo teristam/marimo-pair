@@ -501,6 +501,59 @@ class WorkerIntegrationTests(unittest.TestCase):
                 WorkerManager(root_dir=manager_root).stop_all()
                 parent.close()
 
+    def test_cli_count_notebook_selector_and_token_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent, notebook, _, _, _ = self._start_parent(root, "notebook")
+            manager_root = root / "cli-manager"
+            token_file = root / "parent-token"
+            token_file.write_text(parent.token + "\n", encoding="utf-8")
+            if os.name != "nt":
+                token_file.chmod(0o600)
+            env = os.environ.copy()
+            env.pop("MARIMO_TOKEN", None)
+            env.pop("MARIMO_TOKEN_FILE", None)
+            env.update({"MARIMO_PAIR_HOME": str(manager_root), "PYTHONDONTWRITEBYTECODE": "1"})
+            script = SCRIPTS_DIR / "branch.py"
+
+            def cli(*args, input_text=None):
+                return subprocess.run(
+                    [sys.executable, "-B", str(script), *args], input=input_text,
+                    text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=180, env=env,
+                )
+
+            try:
+                started = cli(
+                    "start", "--parent-url", parent.url, "--parent-notebook", str(notebook),
+                    "--token-file", str(token_file), "--count", "2", "--names", "records",
+                )
+                self.assertEqual(started.returncode, 0, started.stderr[-2000:])
+                workers = json.loads(started.stdout)
+                self.assertEqual(len(workers), 2)
+                self.assertEqual({worker["parent_session"] for worker in workers}, {parent.session})
+                for worker in workers:
+                    ran = cli("run", "--worker", worker["worker_id"], "-",
+                              input_text="records.append(2)\nprint(records)")
+                    self.assertEqual(ran.returncode, 0, ran.stderr[-2000:])
+                    # Each worker mutates its own copy of the one shared snapshot.
+                    self.assertIn("[1, 2]", ran.stdout)
+
+                # The second worker's later batch must use its own private paths.
+                self._create_parent_cell(parent, "count_later = 'fresh'")
+                added = cli("add", "--worker", workers[1]["worker_id"], "--token-file", str(token_file),
+                            "--names", "count_later")
+                self.assertEqual(added.returncode, 0, added.stderr[-2000:])
+                ran_later = cli("run", "--worker", workers[1]["worker_id"], "-", input_text="print(count_later)")
+                self.assertIn("fresh", ran_later.stdout)
+
+                for worker in workers:
+                    stopped = cli("stop", "--worker", worker["worker_id"])
+                    self.assertEqual(stopped.returncode, 0, stopped.stderr[-2000:])
+                self.assertEqual(WorkerManager(root_dir=manager_root).list_workers(), [])
+            finally:
+                WorkerManager(root_dir=manager_root).stop_all()
+                parent.close()
+
     def test_script_header_overrides_project_runtime_and_uses_project_root_dotenv(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
