@@ -1844,7 +1844,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise BranchError(
                         "Worker startup requires an SSE drainer that cannot survive this CLI process; "
                         "cleanup also failed: " + "; ".join(cleanup_errors)
-                    )
+                    ) from None
                 raise BranchError(
                     "Worker startup requires a process-local SSE drainer; use a persistent coordinator "
                     "instead of the short-lived start CLI"

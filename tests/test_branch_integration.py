@@ -530,6 +530,7 @@ class WorkerIntegrationTests(unittest.TestCase):
                 self.assertEqual(started.returncode, 0, started.stderr[-2000:])
                 workers = json.loads(started.stdout)
                 self.assertEqual(len(workers), 2)
+                self.assertNotEqual(workers[0]["worker_id"], workers[1]["worker_id"])
                 self.assertEqual({worker["parent_session"] for worker in workers}, {parent.session})
                 for worker in workers:
                     ran = cli("run", "--worker", worker["worker_id"], "-",
@@ -544,6 +545,7 @@ class WorkerIntegrationTests(unittest.TestCase):
                             "--names", "count_later")
                 self.assertEqual(added.returncode, 0, added.stderr[-2000:])
                 ran_later = cli("run", "--worker", workers[1]["worker_id"], "-", input_text="print(count_later)")
+                self.assertEqual(ran_later.returncode, 0, ran_later.stderr[-2000:])
                 self.assertIn("fresh", ran_later.stdout)
 
                 for worker in workers:
