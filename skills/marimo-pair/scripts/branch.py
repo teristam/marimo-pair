@@ -23,7 +23,7 @@ import urllib.request
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 # The coordinator must not emit repository bytecode artifacts while importing
 # its fixed helper or starting workers.
@@ -207,6 +207,39 @@ def redact_log_text(text: str, tokens: Sequence[str]) -> str:
         r"\1[REDACTED]",
         text,
     )
+
+
+def _checked_token(value: str, source: str) -> str:
+    if not value:
+        raise BranchError(f"Parent token from {source} is empty")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise BranchError(f"Parent token from {source} contains control characters")
+    return value
+
+
+def parent_token(token_file: str | None = None) -> str:
+    """Resolve the parent bearer token: --token-file, MARIMO_TOKEN_FILE, then MARIMO_TOKEN."""
+    path = token_file or os.environ.get("MARIMO_TOKEN_FILE")
+    if path:
+        try:
+            value = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise BranchError(f"Token file is unreadable: {path}: {error}") from error
+        return _checked_token(value.rstrip("\r\n"), f"token file {path}")
+    value = os.environ.get("MARIMO_TOKEN")
+    if not value:
+        raise BranchError(
+            "Set MARIMO_TOKEN_FILE (or pass --token-file) to authenticate to the parent session"
+        )
+    return _checked_token(value, "MARIMO_TOKEN")
+
+
+def _without_token_sources(environ: Mapping[str, str]) -> dict[str, str]:
+    """Copy an environment without either token source; callers set MARIMO_TOKEN explicitly."""
+    env = dict(environ)
+    env.pop("MARIMO_TOKEN", None)
+    env.pop("MARIMO_TOKEN_FILE", None)
+    return env
 
 
 def _per_user_root() -> Path:
@@ -545,8 +578,7 @@ def _git_bash_candidate() -> Path | None:
 
 
 def _bash_environment() -> dict[str, str]:
-    env = os.environ.copy()
-    env.pop("MARIMO_TOKEN", None)
+    env = _without_token_sources(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
 
@@ -637,6 +669,7 @@ class WorkerManager:
         request_timeout: float = 10.0,
         execution_timeout: float | None = 300.0,
         shutdown_timeout: float = 10.0,
+        parent_token_file: str | None = None,
     ) -> None:
         self.root_dir = Path(root_dir or _per_user_root()).expanduser().absolute()
         self.registry_dir = self.root_dir / "workers"
@@ -649,6 +682,7 @@ class WorkerManager:
         self.request_timeout = request_timeout
         self.execution_timeout = execution_timeout
         self.shutdown_timeout = shutdown_timeout
+        self.parent_token_file = parent_token_file
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._drainers: dict[str, tuple[Any, threading.Thread, threading.Event]] = {}
         self.forced_kills = 0
@@ -733,9 +767,7 @@ class WorkerManager:
     def parent_target(self, url: str, session_id: str) -> ParentTarget:
         """Resolve a current session to its notebook without global discovery."""
         base = self._validate_parent_url(url)
-        token = os.environ.get("MARIMO_TOKEN")
-        if not token:
-            raise BranchError("Set MARIMO_TOKEN to authenticate to the parent session")
+        token = self._parent_token()
         status, sessions = self._sessions(base, token)
         entry = sessions.get(session_id) if sessions is not None else None
         path = _session_path(entry)
@@ -745,6 +777,17 @@ class WorkerManager:
         if not notebook.is_file():
             raise BranchError(f"Parent notebook is not a regular file: {notebook}")
         return ParentTarget(base, session_id, notebook)
+
+    def _parent_token(self) -> str:
+        return parent_token(self.parent_token_file)
+
+    def _redaction_tokens(self, *tokens: str) -> list[str]:
+        """Secrets to scrub from errors: the given tokens plus the parent token, if resolvable."""
+        try:
+            known = self._parent_token()
+        except BranchError:
+            known = ""
+        return [*tokens, known]
 
     @staticmethod
     def read_token(record: WorkerRecord) -> str:
@@ -849,9 +892,7 @@ class WorkerManager:
         base = self._validate_parent_url(parent.url)
         if not parent.session_id or "\n" in parent.session_id:
             raise BranchError("A current parent session ID is required")
-        token = os.environ.get("MARIMO_TOKEN")
-        if not token:
-            raise BranchError("Set MARIMO_TOKEN to authenticate to the parent session")
+        token = self._parent_token()
         notebook = _real_path(parent.notebook_path)
         if not notebook.is_file() or not os.access(notebook, os.R_OK):
             raise BranchError(f"Parent notebook is inaccessible: {notebook}")
@@ -919,11 +960,9 @@ class WorkerManager:
             names, record.bundle_path, record.runtime_path, helper,
             record.parent_notebook_path,
         )
-        env = os.environ.copy()
-        parent_token = env.pop("MARIMO_TOKEN", None)
-        if not parent_token:
-            raise BranchError("Set MARIMO_TOKEN to authenticate to the parent session")
-        env["MARIMO_TOKEN"] = parent_token
+        token = self._parent_token()
+        env = _without_token_sources(os.environ)
+        env["MARIMO_TOKEN"] = token
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         command = [
             str(bash), _path_text(self.execute_script),
@@ -940,7 +979,7 @@ class WorkerManager:
         except OSError as error:
             raise BranchError(f"Could not execute the parent exporter: {error}") from error
         if result.returncode != 0 or not record.runtime_path.is_file() or not record.bundle_path.is_file():
-            detail = redact_log_text((result.stderr or result.stdout or "exporter produced no artifacts")[-2000:], [parent_token])
+            detail = redact_log_text((result.stderr or result.stdout or "exporter produced no artifacts")[-2000:], [token])
             raise BranchError(f"Parent value export failed: {detail}")
 
     def start_worker(self, parent: ParentTarget, names: Sequence[str]) -> WorkerRecord:
@@ -976,7 +1015,7 @@ class WorkerManager:
                     token = self.read_token(record)
                 except BranchError:
                     token = ""
-                detail = redact_log_text(str(error), [token, os.environ.get("MARIMO_TOKEN", "")])
+                detail = redact_log_text(str(error), self._redaction_tokens(token))
                 raise BranchError(
                     f"Worker startup failed and cleanup is incomplete; worker {record.worker_id} "
                     f"remains registered for recovery: {detail}"
@@ -994,8 +1033,7 @@ class WorkerManager:
         ]
 
     def _child_environment(self) -> dict[str, str]:
-        env = os.environ.copy()
-        env.pop("MARIMO_TOKEN", None)
+        env = _without_token_sources(os.environ)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         return env
 
@@ -1038,7 +1076,7 @@ class WorkerManager:
             return ""
         return redact_log_text(
             "\n".join(text.splitlines()[-40:]),
-            [token, os.environ.get("MARIMO_TOKEN", "")],
+            self._redaction_tokens(token),
         )
 
     def _assert_unauthenticated_rejected(self, base: str) -> None:
@@ -1214,7 +1252,7 @@ print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps({{"status": _bp_status, "cell_id
             token = self.read_token(record)
             detail = redact_log_text(
                 result.stderr or result.output,
-                [token, os.environ.get("MARIMO_TOKEN", "")],
+                self._redaction_tokens(token),
             )[-2000:]
             raise BranchError(f"Worker {purpose} failed: {detail}")
         return result
@@ -1272,7 +1310,7 @@ print("MARIMO_PAIR_BOOTSTRAP:" + _bp_json.dumps({{"status": _bp_status, "cell_id
                         continue
                 self._retire_spawn(record, process, force=True)
                 if isinstance(error, BranchError) and "Redacted log tail:" not in str(error):
-                    detail = redact_log_text(str(error), [token, os.environ.get("MARIMO_TOKEN", "")])
+                    detail = redact_log_text(str(error), self._redaction_tokens(token))
                     tail = self._read_log_tail(record, token)
                     if tail:
                         raise BranchError(f"{detail}\nRedacted log tail:\n{tail}") from error
@@ -1419,8 +1457,7 @@ async with cm.get_context() as _bp_cleanup_ctx:
             self._validate_worker(record)
         bash = self._bash()
         token = self.read_token(record)
-        env = os.environ.copy()
-        env.pop("MARIMO_TOKEN", None)
+        env = _without_token_sources(os.environ)
         env["MARIMO_TOKEN"] = token
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         command = [
@@ -1434,8 +1471,8 @@ async with cm.get_context() as _bp_cleanup_ctx:
             )
             return ExecutionResult(
                 completed.returncode == 0,
-                redact_log_text(completed.stdout, [token, os.environ.get("MARIMO_TOKEN", "")]),
-                redact_log_text(completed.stderr, [token, os.environ.get("MARIMO_TOKEN", "")]),
+                redact_log_text(completed.stdout, self._redaction_tokens(token)),
+                redact_log_text(completed.stderr, self._redaction_tokens(token)),
                 completed.returncode,
             )
         except subprocess.TimeoutExpired as error:
@@ -1443,8 +1480,8 @@ async with cm.get_context() as _bp_cleanup_ctx:
             stderr = error.stderr.decode(errors="replace") if isinstance(error.stderr, bytes) else error.stderr or ""
             return ExecutionResult(
                 False,
-                redact_log_text(stdout, [token, os.environ.get("MARIMO_TOKEN", "")]),
-                redact_log_text(stderr, [token, os.environ.get("MARIMO_TOKEN", "")]),
+                redact_log_text(stdout, self._redaction_tokens(token)),
+                redact_log_text(stderr, self._redaction_tokens(token)),
                 -1,
             )
         except OSError as error:
@@ -1536,7 +1573,7 @@ async with cm.get_context() as _bp_cleanup_ctx:
         if not 200 <= status < 300:
             safe_body = redact_log_text(
                 body[:500].decode("utf-8", errors="replace"),
-                [token, os.environ.get("MARIMO_TOKEN", "")],
+                self._redaction_tokens(token),
             )
             shutdown_error = BranchError(f"Worker shutdown endpoint returned HTTP {status}: {safe_body}")
         self._stop_drainer(record.worker_id)
@@ -1653,11 +1690,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     start = subparsers.add_parser("start", help="start a worker from named parent values")
     start.add_argument("--parent-url", required=True)
     start.add_argument("--parent-session", required=True)
+    start.add_argument(
+        "--token-file",
+        help="file holding the parent token (default: $MARIMO_TOKEN_FILE, then $MARIMO_TOKEN)",
+    )
     start.add_argument("--names", nargs="+", required=True)
 
     add = subparsers.add_parser("add", help="coordinator-only named export to a worker")
     add.add_argument("--worker", required=True)
     add.add_argument("--parent-session", required=True)
+    add.add_argument(
+        "--token-file",
+        help="file holding the parent token (default: $MARIMO_TOKEN_FILE, then $MARIMO_TOKEN)",
+    )
     add.add_argument("--names", nargs="+", required=True)
 
     run = subparsers.add_parser("run", help="execute stdin code in one explicit worker")
@@ -1670,6 +1715,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     manager = WorkerManager()
+    manager.parent_token_file = getattr(args, "token_file", None)
     try:
         if args.command == "start":
             selected = validate_names(args.names)

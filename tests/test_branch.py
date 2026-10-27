@@ -1,6 +1,8 @@
+import io
 import json
 import os
 import platform
+import shutil
 import sys
 import tempfile
 import time
@@ -25,6 +27,21 @@ from branch import (
     process_matches,
 )
 from branch_state import BranchStateError
+
+
+def _record(directory: Path, **overrides) -> branch.WorkerRecord:
+    directory = Path(directory)
+    values = dict(
+        worker_id="a" * 32, url="http://127.0.0.1:1234", session_id="worker-session",
+        token_path=directory / "worker-token", notebook_path=directory / "worker.py",
+        temp_dir=directory, runtime_path=directory / "runtime.json",
+        parent_url="http://127.0.0.1:2718", parent_notebook_path=directory / "parent.py",
+        parent_session_id="s_parent", status="running", server_pid=None, process_identity=None,
+        imported_names=(), log_path=directory / "worker.log",
+        bundle_path=directory / "values.pickle", helper_path=directory / "branch_state.py",
+    )
+    values.update(overrides)
+    return branch.WorkerRecord(**values)
 
 
 class SSETests(unittest.TestCase):
@@ -502,7 +519,7 @@ class WorkerManagerUnitTests(unittest.TestCase):
             )
             record.token_path.write_text("secret", encoding="utf-8")
             with (
-                mock.patch.dict(os.environ, {"MARIMO_TOKEN": "parent-secret"}),
+                mock.patch.dict(os.environ, {"MARIMO_TOKEN": "parent-secret", "MARIMO_TOKEN_FILE": "/parent/token"}),
                 mock.patch.object(manager, "_validate_worker", return_value=None),
                 mock.patch.object(manager, "_bash", return_value=Path("/bin/bash")),
                 mock.patch.object(branch.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="ok", stderr="")) as run,
@@ -520,6 +537,7 @@ class WorkerManagerUnitTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
             self.assertEqual(run.call_args.kwargs["env"]["MARIMO_TOKEN"], "secret")
             self.assertNotEqual(run.call_args.kwargs["env"]["MARIMO_TOKEN"], "parent-secret")
+            self.assertNotIn("MARIMO_TOKEN_FILE", run.call_args.kwargs["env"])
             self.assertEqual(run.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
             self.assertEqual(result.output, "ok")
 
@@ -879,6 +897,98 @@ class WorkerManagerUnitTests(unittest.TestCase):
             ):
                 fresh.stop_worker(record.worker_id)
             self.assertEqual(fresh.list_workers(), [])
+
+
+class ParentTokenTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+
+    def _file(self, name, data: bytes) -> str:
+        path = self.directory / name
+        path.write_bytes(data)
+        return str(path)
+
+    def test_precedence_is_argument_then_env_file_then_env_token(self):
+        flag = self._file("flag", b"flag-secret\n")
+        env_file = self._file("env", b"env-file-secret\r\n")
+        with mock.patch.dict(os.environ, {"MARIMO_TOKEN_FILE": env_file, "MARIMO_TOKEN": "env-secret"}):
+            self.assertEqual(branch.parent_token(flag), "flag-secret")
+            self.assertEqual(branch.parent_token(None), "env-file-secret")
+        with mock.patch.dict(os.environ, {"MARIMO_TOKEN": "env-secret"}, clear=False):
+            os.environ.pop("MARIMO_TOKEN_FILE", None)
+            self.assertEqual(branch.parent_token(None), "env-secret")
+
+    def test_invalid_sources_raise_branch_errors(self):
+        cases = [
+            (self._file("empty", b"\n"), "empty"),
+            (self._file("multi", b"first\nsecond\n"), "control"),
+            (str(self.directory / "missing"), "unreadable"),
+        ]
+        for path, message in cases:
+            with self.subTest(message=message), self.assertRaises(BranchError) as caught:
+                branch.parent_token(path)
+            self.assertIn(message, str(caught.exception).lower())
+        with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(BranchError) as caught:
+            branch.parent_token(None)
+        self.assertIn("MARIMO_TOKEN_FILE", str(caught.exception))
+
+    def test_worker_execution_env_drops_parent_token_file(self):
+        manager = WorkerManager(root_dir=self.directory / "home")
+        record = _record(self.directory)
+        record.token_path.write_text("worker-secret", encoding="utf-8")
+        parent_file = self._file("parent-token", b"parent-file-secret\n")
+        with (
+            mock.patch.dict(os.environ, {"MARIMO_TOKEN_FILE": parent_file, "MARIMO_TOKEN": "parent-env"}),
+            mock.patch.object(manager, "_validate_worker", return_value=None),
+            mock.patch.object(manager, "_bash", return_value=Path("/bin/bash")),
+            mock.patch.object(branch.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout="leaked parent-file-secret", stderr="")) as run,
+        ):
+            result = manager.execute(record.worker_id, "print(1)", record=record)
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["MARIMO_TOKEN"], "worker-secret")
+        self.assertNotIn("MARIMO_TOKEN_FILE", env)
+        self.assertNotIn("parent-file-secret", result.output)
+
+    def test_parent_export_uses_file_token_and_redacts_it(self):
+        manager = WorkerManager(root_dir=self.directory / "home")
+        manager.parent_token_file = self._file("parent-token", b"parent-file-secret\n")
+        record = _record(self.directory)
+        parent = ParentTarget("http://127.0.0.1:2718", "s_parent", self.directory / "parent.py")
+        with (
+            mock.patch.dict(os.environ, {"MARIMO_TOKEN": "parent-env"}),
+            mock.patch.object(manager, "_bash", return_value=Path("/bin/bash")),
+            mock.patch.object(branch.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout="", stderr="echo parent-file-secret")) as run,
+        ):
+            with self.assertRaises(BranchError) as caught:
+                manager._export_parent(record, parent, ["records"])
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["MARIMO_TOKEN"], "parent-file-secret")
+        self.assertNotIn("MARIMO_TOKEN_FILE", env)
+        self.assertNotIn("parent-file-secret", str(caught.exception))
+
+    def test_worker_server_environment_has_no_token_sources(self):
+        manager = WorkerManager(root_dir=self.directory / "home")
+        with mock.patch.dict(os.environ, {"MARIMO_TOKEN_FILE": "/x", "MARIMO_TOKEN": "y"}):
+            env = manager._child_environment()
+            bash_env = branch._bash_environment()
+        for candidate in (env, bash_env):
+            self.assertNotIn("MARIMO_TOKEN", candidate)
+            self.assertNotIn("MARIMO_TOKEN_FILE", candidate)
+
+    def test_cli_start_reads_token_file_argument(self):
+        missing = str(self.directory / "missing-token")
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"MARIMO_PAIR_HOME": str(self.directory / "home"), "MARIMO_TOKEN": "env"}), \
+                mock.patch.object(branch.sys, "stderr", stderr):
+            result = branch.main([
+                "start", "--parent-url", "http://127.0.0.1:2718", "--parent-session", "s",
+                "--token-file", missing, "--names", "records",
+            ])
+        self.assertEqual(result, 1)
+        self.assertIn("missing-token", stderr.getvalue())
 
 
 if __name__ == "__main__":
