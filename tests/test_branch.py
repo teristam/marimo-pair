@@ -4,8 +4,10 @@ import json
 import os
 import platform
 import shutil
+import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -974,6 +976,63 @@ class ParentTokenTests(unittest.TestCase):
         self.assertEqual(env["MARIMO_TOKEN"], "parent-file-secret")
         self.assertNotIn("MARIMO_TOKEN_FILE", env)
         self.assertNotIn("parent-file-secret", str(caught.exception))
+
+    def _hanging_server(self):
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        accepted = []
+        stop = threading.Event()
+
+        def accept():
+            server.settimeout(0.1)
+            while not stop.is_set():
+                try:
+                    accepted.append(server.accept()[0])
+                except OSError:
+                    continue
+
+        thread = threading.Thread(target=accept, daemon=True)
+        thread.start()
+
+        def close():
+            stop.set()
+            thread.join(timeout=2)
+            for conn in accepted:
+                conn.close()
+            server.close()
+
+        self.addCleanup(close)
+        return server.getsockname()[1]
+
+    def _auth_files(self, directory):
+        return sorted(Path(directory).glob("marimo-pair-auth.*"))
+
+    @unittest.skipUnless(shutil.which("bash") and shutil.which("jq") and shutil.which("curl"), "requires Bash, jq and curl")
+    @unittest.skipIf(os.name == "nt", "POSIX temp directory")
+    def test_timed_out_execution_leaves_no_header_file_in_system_temp(self):
+        port = self._hanging_server()
+        manager = WorkerManager(root_dir=self.directory / "home", execution_timeout=1.5)
+        private = self.directory / "private"
+        private.mkdir(mode=0o700)
+        record = _record(
+            self.directory, url=f"http://127.0.0.1:{port}", temp_dir=private,
+            parent_url=f"http://127.0.0.1:{port}", token_path=self.directory / "tok",
+        )
+        record.token_path.write_text("worker-secret", encoding="utf-8")
+        parent = ParentTarget(record.parent_url, "s_parent", self.directory / "parent.py")
+        system_tmp = tempfile.gettempdir()
+        before = set(self._auth_files(system_tmp))
+        with mock.patch.dict(os.environ, {"MARIMO_TOKEN": "parent-secret"}):
+            result = manager._execute_record(record, "print(1)", validate=False)
+            self.assertFalse(result.success)
+            with self.assertRaises(BranchError):
+                manager._export_parent(record, parent, ["records"])
+        self.assertEqual(set(self._auth_files(system_tmp)) - before, set())
+        # The header file is left where worker cleanup removes it.
+        self.assertTrue(self._auth_files(private))
+        for path in self._auth_files(private):
+            self.assertEqual(path.parent, private)
 
     def test_worker_server_environment_has_no_token_sources(self):
         manager = WorkerManager(root_dir=self.directory / "home")

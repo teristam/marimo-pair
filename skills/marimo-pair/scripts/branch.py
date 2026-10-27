@@ -1002,6 +1002,9 @@ class WorkerManager:
         env = _without_token_sources(os.environ)
         env["MARIMO_TOKEN"] = token
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # A timeout SIGKILLs the script before its EXIT trap can remove the bearer
+        # header file, so keep it in the worker's private directory.
+        env["TMPDIR"] = str(record.temp_dir)
         command = [
             str(bash), _path_text(self.execute_script),
             "--url", record.parent_url, "--session", parent.session_id, "-",
@@ -1548,6 +1551,9 @@ async with cm.get_context() as _bp_cleanup_ctx:
         env = _without_token_sources(os.environ)
         env["MARIMO_TOKEN"] = token
         env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # A timeout SIGKILLs the script before its EXIT trap can remove the bearer
+        # header file, so keep it in the worker's private directory.
+        env["TMPDIR"] = str(record.temp_dir)
         command = [
             str(bash), _path_text(self.execute_script), "--url", record.url,
             "--session", record.session_id, "-",
