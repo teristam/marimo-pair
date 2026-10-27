@@ -771,8 +771,12 @@ class WorkerManager:
 
     def resolve_parent(
         self, url: str, *, notebook: str | Path | None = None, session: str | None = None,
+        prefer: str | None = None,
     ) -> ParentTarget:
-        """Select the parent session by key, session_id field, notebook path, or lone session."""
+        """Select the parent session by key, session_id field, notebook path, or lone session.
+
+        ``prefer`` only breaks a notebook ambiguity, and only when it is one of the matches.
+        """
         base = self._validate_parent_url(url)
         status, sessions = self._sessions(base, self._parent_token())
         if not 200 <= status < 300 or sessions is None:
@@ -796,6 +800,8 @@ class WorkerManager:
             matches = [item for item in entries if item[1] and _same_notebook_path(item[1], notebook)]
             if not matches:
                 raise BranchError(f"No active parent session for {notebook}; open sessions: {listing()}")
+            if len(matches) > 1 and prefer is not None:
+                matches = [item for item in matches if item[0] == prefer] or matches
             if len(matches) > 1:
                 keys = ", ".join(key for key, _, _ in matches)
                 raise BranchError(
@@ -1478,6 +1484,7 @@ async with cm.get_context() as _bp_cleanup_ctx:
         # reconnects rename sessions, so a stored key may be stale.
         resolved = self.resolve_parent(
             record.parent_url, notebook=record.parent_notebook_path, session=parent_session_id,
+            prefer=record.parent_session_id,
         )
         parent = ParentTarget(record.parent_url, resolved.session_id, record.parent_notebook_path)
         canonical_parent = self._validate_parent(parent)

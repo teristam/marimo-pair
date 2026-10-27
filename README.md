@@ -62,8 +62,11 @@ Use isolated workers to explore mutable copies of selected **live** notebook
 values without rerunning the parent's preprocessing. The coordinator needs a
 local, token-protected parent, its URL, and a token file (coordinator-only, never a branch agent's).
 `branch.py` resolves the parent session itself from `--parent-notebook`; there
-is no session ID to look up or refresh after a browser reconnect. A `--no-token`
-parent cannot be used for branching.
+is normally no session ID to look up or refresh after a browser reconnect
+(`add` reuses the worker's stored one to pick among several sessions on the
+notebook). `--parent-session` is needed only when several sessions are open on
+the notebook and the stored one is gone. A `--no-token` parent cannot be used
+for branching.
 
 Replace `/absolute/path/to/marimo-pair` with the installed skill directory
 and use `python3` if `python` is unavailable. Run these commands from the
@@ -75,6 +78,9 @@ coordinator, with `PARENT_URL`, `PARENT_NOTEBOOK` (absolute path), and
 bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
   --url "$PARENT_URL" --file "$PARENT_NOTEBOOK" --token-file "$TOKEN_FILE" \
   -c "import marimo._code_mode as cm; help(cm)"
+# Note: execute-code.sh --file must be the notebook path exactly as the server
+# reports it (absolute; no symlink or alternate spelling), unlike branch.py's
+# canonical match.
 
 # Start one worker per branch agent; save the returned worker_id as WORKER_ID.
 python /absolute/path/to/marimo-pair/scripts/branch.py start \

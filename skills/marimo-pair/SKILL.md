@@ -79,6 +79,9 @@ bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
   -c "import marimo._code_mode as cm; help(cm)"
 ```
 
+`--file` must be the notebook path exactly as the server reports it (absolute;
+no symlink or alternate spelling), unlike `branch.py`'s canonical match.
+
 After it succeeds, start one private worker per branch agent with a single
 export of only the requested names:
 

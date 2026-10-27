@@ -1102,6 +1102,16 @@ class ParentResolutionTests(unittest.TestCase):
         self.assertIn("No active parent session", str(caught.exception))
         self.assertIn("s_a", str(caught.exception))
 
+    def test_prefer_breaks_a_notebook_ambiguity_only_when_it_is_a_match(self):
+        sessions = {"s_1": {"path": str(self.a)}, "s_2": {"path": str(self.a)}, "s_b": {"path": str(self.b)}}
+        self.assertEqual(self._resolve(sessions, notebook=self.a, prefer="s_2").session_id, "s_2")
+        for prefer in ("s_b", "s_gone", None):
+            with self.subTest(prefer=prefer), self.assertRaises(BranchError) as caught:
+                self._resolve(sessions, notebook=self.a, prefer=prefer)
+            self.assertIn("--parent-session", str(caught.exception))
+        # An explicit session still wins over a stale preference.
+        self.assertEqual(self._resolve(sessions, notebook=self.a, session="s_1", prefer="s_2").session_id, "s_1")
+
     def test_lone_session_is_the_default_and_several_require_a_selector(self):
         self.assertEqual(self._resolve({"s_a": {"path": str(self.a)}}).session_id, "s_a")
         for sessions in ({}, {"s_a": {"path": str(self.a)}, "s_b": {"path": str(self.b)}}):
@@ -1138,7 +1148,9 @@ class ParentResolutionTests(unittest.TestCase):
         ) as validate, mock.patch.object(self.manager, "_export_parent") as export:
             with self.assertRaises(BranchError):
                 self.manager.add_worker(record.worker_id, None, ["new_value"])
-        resolve.assert_called_once_with(record.parent_url, notebook=self.a, session=None)
+        resolve.assert_called_once_with(
+            record.parent_url, notebook=self.a, session=None, prefer=record.parent_session_id,
+        )
         self.assertEqual(validate.call_args.args[0].session_id, "s_after_reconnect")
         export.assert_not_called()
 
