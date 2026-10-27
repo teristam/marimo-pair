@@ -339,11 +339,14 @@ class WorkerManagerUnitTests(unittest.TestCase):
             manager, "_validate_worker"
         ), mock.patch.object(manager, "_inspect_worker_names", return_value={"from_agent"}), mock.patch.object(
             manager, "_validate_parent"
-        ) as validate_parent, mock.patch.object(manager, "_export_parent") as export:
+        ) as validate_parent, mock.patch.object(manager, "_export_parent") as export, mock.patch.object(
+            manager, "resolve_parent"
+        ) as resolve_parent:
             for names in (["records"], ["from_agent"], ["_private"], ["__dunder__"]):
                 with self.subTest(names=names), self.assertRaises((BranchError, ValueError)):
                     manager.add_worker(record.worker_id, "fresh-session", names)
         validate_parent.assert_not_called()
+        resolve_parent.assert_not_called()
         export.assert_not_called()
 
     def test_worker_definition_inspector_reads_graph_cell_definitions(self):
@@ -359,7 +362,8 @@ class WorkerManagerUnitTests(unittest.TestCase):
     def test_add_validates_fresh_parent_session_path_before_export(self):
         manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
         record = mock.Mock(worker_id="b" * 32, imported_names=("records",), status="running")
-        with mock.patch.object(manager, "_read_record", return_value=record), mock.patch.object(
+        with mock.patch.object(manager, "_read_record", return_value=record), mock.patch.object(manager, "resolve_parent", return_value=ParentTarget(
+            "http://127.0.0.1:1234", "fresh-session", Path("parent.py"))), mock.patch.object(
             manager, "_validate_worker"
         ), mock.patch.object(manager, "_inspect_worker_names", return_value=set()), mock.patch.object(
             manager, "_validate_parent", side_effect=BranchError("stale session")
@@ -385,7 +389,8 @@ class WorkerManagerUnitTests(unittest.TestCase):
             sys_path=(), python_executable=sys.executable, python_version=platform.python_version(),
             pythonpath=(), dotenv=(), sandbox_context={}, dependency_context={},
         )
-        with mock.patch.object(manager, "_read_record", return_value=record), mock.patch.object(
+        with mock.patch.object(manager, "_read_record", return_value=record), mock.patch.object(manager, "resolve_parent", return_value=ParentTarget(
+            "http://127.0.0.1:1234", "fresh-session", Path("parent.py"))), mock.patch.object(
             manager, "_validate_worker"
         ), mock.patch.object(manager, "_inspect_worker_names", return_value=set()), mock.patch.object(
             manager, "_validate_parent", return_value=str(record.temp_dir / "parent.py")
@@ -408,14 +413,14 @@ class WorkerManagerUnitTests(unittest.TestCase):
         self.assertFalse(record.runtime_path.exists())
 
     def test_start_cli_rejects_private_names_before_parent_contact(self):
-        with mock.patch.object(branch.WorkerManager, "parent_target") as parent_target, mock.patch.object(
+        with mock.patch.object(branch.WorkerManager, "resolve_parent") as resolve_parent, mock.patch.object(
             branch.sys, "stderr"
         ):
             self.assertEqual(branch.main([
                 "start", "--parent-url", "http://127.0.0.1:1234", "--parent-session", "s",
                 "--names", "_private",
             ]), 1)
-        parent_target.assert_not_called()
+        resolve_parent.assert_not_called()
 
     def test_cli_start_refuses_process_local_sse_drainer(self):
         worker_id = "f" * 32
@@ -425,7 +430,7 @@ class WorkerManagerUnitTests(unittest.TestCase):
             manager._drainers = {worker_id: (mock.Mock(), mock.Mock(), mock.Mock())}
 
         with mock.patch.object(branch.WorkerManager, "__init__", autospec=True, side_effect=initialize), mock.patch.object(
-            branch.WorkerManager, "parent_target", return_value=ParentTarget("http://127.0.0.1:4321", "parent", Path("parent.py"))
+            branch.WorkerManager, "resolve_parent", return_value=ParentTarget("http://127.0.0.1:4321", "parent", Path("parent.py"))
         ), mock.patch.object(branch.WorkerManager, "start_worker", return_value=record), mock.patch.object(
             branch.WorkerManager, "stop_worker"
         ) as stop_worker, mock.patch.object(branch.sys, "stderr"):
@@ -989,6 +994,103 @@ class ParentTokenTests(unittest.TestCase):
             ])
         self.assertEqual(result, 1)
         self.assertIn("missing-token", stderr.getvalue())
+
+
+class ParentResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.manager = WorkerManager(root_dir=self.directory / "home")
+        self.a = self.directory / "a.py"
+        self.b = self.directory / "b.py"
+        self.a.write_text("", encoding="utf-8")
+        self.b.write_text("", encoding="utf-8")
+        patcher = mock.patch.dict(os.environ, {"MARIMO_TOKEN": "parent-secret"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _resolve(self, sessions, status=200, **kwargs):
+        with mock.patch.object(self.manager, "_sessions", return_value=(status, sessions)):
+            return self.manager.resolve_parent("http://localhost:2718/", **kwargs)
+
+    def test_session_key_and_session_id_field_both_resolve_to_the_key(self):
+        sessions = {"s_a": {"session_id": "sess-1", "path": str(self.a)}}
+        for session in ("s_a", "sess-1"):
+            with self.subTest(session=session):
+                target = self._resolve(sessions, session=session)
+                self.assertEqual(target, ParentTarget("http://localhost:2718", "s_a", self.a))
+
+    def test_notebook_selects_its_session_including_relative_and_symlinked_paths(self):
+        sessions = {"s_a": {"path": str(self.a)}, "s_b": {"path": str(self.b)}}
+        link = self.directory / "link.py"
+        link.symlink_to(self.a)
+        cwd = os.getcwd()
+        os.chdir(self.directory)
+        self.addCleanup(os.chdir, cwd)
+        for notebook in (self.a, "a.py", link):
+            with self.subTest(notebook=str(notebook)):
+                self.assertEqual(self._resolve(sessions, notebook=notebook).session_id, "s_a")
+
+    def test_ambiguous_and_missing_notebooks_fail_with_session_keys(self):
+        with self.assertRaises(BranchError) as caught:
+            self._resolve({"s_1": {"path": str(self.a)}, "s_2": {"path": str(self.a)}}, notebook=self.a)
+        self.assertIn("s_1", str(caught.exception))
+        self.assertIn("s_2", str(caught.exception))
+        self.assertIn("--parent-session", str(caught.exception))
+        with self.assertRaises(BranchError) as caught:
+            self._resolve({"s_a": {"path": str(self.a)}}, notebook=self.b)
+        self.assertIn("No active parent session", str(caught.exception))
+        self.assertIn("s_a", str(caught.exception))
+
+    def test_lone_session_is_the_default_and_several_require_a_selector(self):
+        self.assertEqual(self._resolve({"s_a": {"path": str(self.a)}}).session_id, "s_a")
+        for sessions in ({}, {"s_a": {"path": str(self.a)}, "s_b": {"path": str(self.b)}}):
+            with self.subTest(count=len(sessions)), self.assertRaises(BranchError) as caught:
+                self._resolve(sessions)
+            self.assertIn("--parent-notebook", str(caught.exception))
+
+    def test_lone_session_without_a_notebook_path_is_rejected_clearly(self):
+        with self.assertRaises(BranchError) as caught:
+            self._resolve({"s_new": {"path": None}})
+        self.assertIn("no notebook path", str(caught.exception))
+
+    def test_session_and_notebook_must_agree(self):
+        with self.assertRaises(BranchError):
+            self._resolve({"s_a": {"path": str(self.a)}}, session="s_a", notebook=self.b)
+
+    def test_unauthenticated_listing_fails(self):
+        with self.assertRaises(BranchError) as caught:
+            self._resolve(None, status=401, session="s_a")
+        self.assertIn("authenticate", str(caught.exception))
+
+    def test_add_resolves_the_current_session_from_the_worker_notebook(self):
+        record = mock.Mock(
+            worker_id="b" * 32, imported_names=("records",), status="running",
+            parent_url="http://127.0.0.1:1234", parent_notebook_path=self.a,
+        )
+        resolved = ParentTarget("http://127.0.0.1:1234", "s_after_reconnect", self.a)
+        with mock.patch.object(self.manager, "_read_record", return_value=record), mock.patch.object(
+            self.manager, "_validate_worker"
+        ), mock.patch.object(self.manager, "_inspect_worker_names", return_value=set()), mock.patch.object(
+            self.manager, "resolve_parent", return_value=resolved
+        ) as resolve, mock.patch.object(
+            self.manager, "_validate_parent", side_effect=BranchError("stop")
+        ) as validate, mock.patch.object(self.manager, "_export_parent") as export:
+            with self.assertRaises(BranchError):
+                self.manager.add_worker(record.worker_id, None, ["new_value"])
+        resolve.assert_called_once_with(record.parent_url, notebook=self.a, session=None)
+        self.assertEqual(validate.call_args.args[0].session_id, "s_after_reconnect")
+        export.assert_not_called()
+
+    def test_cli_start_passes_notebook_and_optional_session(self):
+        with mock.patch.dict(os.environ, {"MARIMO_PAIR_HOME": str(self.directory / "home")}), mock.patch.object(
+            branch.WorkerManager, "resolve_parent", side_effect=BranchError("stop")
+        ) as resolve, mock.patch.object(branch.sys, "stderr", io.StringIO()):
+            self.assertEqual(branch.main([
+                "start", "--parent-url", "http://localhost:2718", "--parent-notebook", str(self.a),
+                "--names", "records",
+            ]), 1)
+        resolve.assert_called_once_with("http://localhost:2718", notebook=str(self.a), session=None)
 
 
 if __name__ == "__main__":

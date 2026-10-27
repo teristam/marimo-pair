@@ -764,19 +764,52 @@ class WorkerManager:
     def get_worker(self, worker_id: str) -> WorkerRecord:
         return self._read_record(worker_id)
 
-    def parent_target(self, url: str, session_id: str) -> ParentTarget:
-        """Resolve a current session to its notebook without global discovery."""
+    def resolve_parent(
+        self, url: str, *, notebook: str | Path | None = None, session: str | None = None,
+    ) -> ParentTarget:
+        """Select the parent session by key, session_id field, notebook path, or lone session."""
         base = self._validate_parent_url(url)
-        token = self._parent_token()
-        status, sessions = self._sessions(base, token)
-        entry = sessions.get(session_id) if sessions is not None else None
-        path = _session_path(entry)
-        if not 200 <= status < 300 or not path:
-            raise BranchError(f"Parent session {session_id!r} is not active or has no notebook path")
-        notebook = _real_path(path)
-        if not notebook.is_file():
-            raise BranchError(f"Parent notebook is not a regular file: {notebook}")
-        return ParentTarget(base, session_id, notebook)
+        status, sessions = self._sessions(base, self._parent_token())
+        if not 200 <= status < 300 or sessions is None:
+            raise BranchError("Could not authenticate to the parent session list")
+        entries = [(key, _session_path(entry), entry) for key, entry in sessions.items()]
+
+        def listing() -> str:
+            return "; ".join(f"{key} -> {path or '<no path>'}" for key, path, _ in entries) or "none"
+
+        if session is not None:
+            matches = [item for item in entries if item[0] == session] or [
+                item for item in entries
+                if isinstance(item[2], dict) and item[2].get("session_id") == session
+            ]
+            if not matches:
+                raise BranchError(f"Parent session {session!r} is not active; open sessions: {listing()}")
+            key, path, _ = matches[0]
+            if notebook is not None and (not path or not _same_notebook_path(path, notebook)):
+                raise BranchError(f"Parent session {key!r} does not map to notebook {notebook}")
+        elif notebook is not None:
+            matches = [item for item in entries if item[1] and _same_notebook_path(item[1], notebook)]
+            if not matches:
+                raise BranchError(f"No active parent session for {notebook}; open sessions: {listing()}")
+            if len(matches) > 1:
+                keys = ", ".join(key for key, _, _ in matches)
+                raise BranchError(
+                    f"{len(matches)} sessions are open for {notebook}: {keys}; pass --parent-session"
+                )
+            key, path, _ = matches[0]
+        else:
+            if len(entries) != 1:
+                raise BranchError(
+                    f"{len(entries)} parent sessions are open; pass --parent-notebook or "
+                    f"--parent-session. Open sessions: {listing()}"
+                )
+            key, path, _ = entries[0]
+        if not path:
+            raise BranchError(f"Parent session {key!r} has no notebook path")
+        real = _real_path(path)
+        if not real.is_file():
+            raise BranchError(f"Parent notebook is not a regular file: {real}")
+        return ParentTarget(base, key, real)
 
     def _parent_token(self) -> str:
         return parent_token(self.parent_token_file)
@@ -1371,7 +1404,7 @@ async with cm.get_context() as _bp_cleanup_ctx:
         if not result.success:
             raise BranchError(f"Could not roll back failed bootstrap cell {cell_id!r}: {result.stderr or result.output}")
 
-    def add_worker(self, worker_id: str, parent_session_id: str, names: Sequence[str]) -> None:
+    def add_worker(self, worker_id: str, parent_session_id: str | None, names: Sequence[str]) -> None:
         """Snapshot a fresh named parent batch into an existing worker."""
         record = self._read_record(worker_id)
         if record.status != "running":
@@ -1388,11 +1421,16 @@ async with cm.get_context() as _bp_cleanup_ctx:
         except ValueError as error:
             raise BranchError(str(error)) from error
 
-        parent = ParentTarget(record.parent_url, parent_session_id, record.parent_notebook_path)
+        # Resolve the *current* session for this worker's notebook; browser
+        # reconnects rename sessions, so a stored key may be stale.
+        resolved = self.resolve_parent(
+            record.parent_url, notebook=record.parent_notebook_path, session=parent_session_id,
+        )
+        parent = ParentTarget(record.parent_url, resolved.session_id, record.parent_notebook_path)
         canonical_parent = self._validate_parent(parent)
         if not _same_notebook_path(canonical_parent, record.parent_notebook_path):
             raise BranchError("Fresh parent session does not map to this worker's original notebook")
-        record.parent_session_id = parent_session_id
+        record.parent_session_id = parent.session_id
         self._write_record(record)
 
         try:
@@ -1688,30 +1726,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     start = subparsers.add_parser("start", help="start a worker from named parent values")
-    start.add_argument("--parent-url", required=True)
-    start.add_argument("--parent-session", required=True)
+    start.add_argument(
+        "--parent-url", required=True,
+        help="loopback URL of the token-protected parent server, e.g. http://localhost:2718",
+    )
+    start.add_argument("--parent-notebook", help="parent notebook path; selects that notebook's session")
+    start.add_argument(
+        "--parent-session",
+        help="exact parent session key or session_id (default: from --parent-notebook or the lone session)",
+    )
+    start.add_argument("--names", nargs="+", required=True, help="parent variable names to copy")
     start.add_argument(
         "--token-file",
         help="file holding the parent token (default: $MARIMO_TOKEN_FILE, then $MARIMO_TOKEN)",
     )
-    start.add_argument("--names", nargs="+", required=True)
 
     add = subparsers.add_parser("add", help="coordinator-only named export to a worker")
-    add.add_argument("--worker", required=True)
-    add.add_argument("--parent-session", required=True)
+    add.add_argument("--worker", required=True, help="worker ID printed by start")
+    add.add_argument(
+        "--parent-session",
+        help="exact parent session key or session_id (default: current session of the worker's notebook)",
+    )
+    add.add_argument("--names", nargs="+", required=True, help="additional parent variable names")
     add.add_argument(
         "--token-file",
         help="file holding the parent token (default: $MARIMO_TOKEN_FILE, then $MARIMO_TOKEN)",
     )
-    add.add_argument("--names", nargs="+", required=True)
 
     run = subparsers.add_parser("run", help="execute stdin code in one explicit worker")
-    run.add_argument("--worker", required=True)
-    run.add_argument("source", choices=["-"])
+    run.add_argument("--worker", required=True, help="worker ID; code is read from stdin")
+    run.add_argument("source", choices=["-"], help="'-' to read code from stdin")
 
     subparsers.add_parser("list", help="list coordinator-owned workers")
     stop = subparsers.add_parser("stop", help="stop one worker")
-    stop.add_argument("--worker", required=True)
+    stop.add_argument("--worker", required=True, help="worker ID to stop")
 
     args = parser.parse_args(argv)
     manager = WorkerManager()
@@ -1719,7 +1767,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "start":
             selected = validate_names(args.names)
-            parent = manager.parent_target(args.parent_url, args.parent_session)
+            parent = manager.resolve_parent(
+                args.parent_url, notebook=args.parent_notebook, session=args.parent_session,
+            )
             record = manager.start_worker(parent, selected)
             if record.worker_id in manager._drainers:
                 try:
