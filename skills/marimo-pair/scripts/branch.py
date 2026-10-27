@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import ctypes
 import hashlib
 import ipaddress
@@ -42,6 +43,10 @@ from branch_state import (
 
 class BranchError(RuntimeError):
     """A parent or worker lifecycle operation failed safely."""
+
+
+# Upper bound for one `start --count`; guards against typos spawning many servers.
+MAX_WORKERS_PER_START = 16
 
 
 @dataclass(frozen=True)
@@ -1017,43 +1022,83 @@ class WorkerManager:
 
     def start_worker(self, parent: ParentTarget, names: Sequence[str]) -> WorkerRecord:
         """Snapshot named parent values, then launch and validate an isolated server."""
+        return self.start_workers(parent, names, 1)[0]
+
+    def start_workers(self, parent: ParentTarget, names: Sequence[str], count: int) -> list[WorkerRecord]:
+        """Export named parent values once, then launch ``count`` workers from that snapshot.
+
+        Startup is all-or-nothing: if any step fails, every worker created so far
+        is stopped and its files removed before the error propagates.
+        """
+        if not 1 <= count <= MAX_WORKERS_PER_START:
+            raise BranchError(f"Worker count must be between 1 and {MAX_WORKERS_PER_START}")
         selected = validate_names(names)
         # Parent identity is checked before any worker directory/registry is created.
         parent_notebook = self._validate_parent(parent)
-        record = self._new_record(parent, parent_notebook, selected)
+        records: list[WorkerRecord] = []
         try:
-            self._write_record(record)
-            # Export metadata before generating the notebook; effective paths come from it.
-            self._export_parent(record, parent, selected)
-            runtime = read_parent_runtime(record.runtime_path)
-            if not _same_notebook_path(runtime.notebook_path, record.parent_notebook_path):
+            first = self._new_record(parent, parent_notebook, selected)
+            records.append(first)
+            self._write_record(first)
+            # One export serves every worker. It lives in the first worker's private
+            # directory, so an interrupted start is recovered by list/stop.
+            self._export_parent(first, parent, selected)
+            runtime = read_parent_runtime(first.runtime_path)
+            if not _same_notebook_path(runtime.notebook_path, first.parent_notebook_path):
                 raise BranchError("Parent runtime metadata identifies a different notebook")
-            shutil.copyfile(Path(branch_state.__file__).resolve(), record.helper_path)
-            if os.name != "nt":
-                record.helper_path.chmod(0o600)
             notebook_text = build_worker_notebook(runtime)
-            _write_private(record.notebook_path, notebook_text)
-            self._launch_and_initialize(record, runtime)
-            record.status = "running"
-            self._write_record(record)
-            # The values and metadata are no longer needed after the bootstrap has run.
-            self._remove_path(record.bundle_path)
-            self._remove_path(record.runtime_path)
-            self._remove_path(record.helper_path)
-            return record
+            for index in range(count):
+                if index == 0:
+                    record = first
+                else:
+                    record = self._new_record(parent, parent_notebook, selected)
+                    record.bundle_path = first.bundle_path
+                    record.runtime_path = first.runtime_path
+                    records.append(record)
+                    self._write_record(record)
+                shutil.copyfile(Path(branch_state.__file__).resolve(), record.helper_path)
+                if os.name != "nt":
+                    record.helper_path.chmod(0o600)
+                _write_private(record.notebook_path, notebook_text)
+                self._launch_and_initialize(record, runtime)
+            # The values and metadata are no longer needed after every bootstrap has run.
+            self._remove_path(first.bundle_path)
+            self._remove_path(first.runtime_path)
+            for record in records:
+                self._remove_path(record.helper_path)
+                # Later `add` batches use each worker's own private paths.
+                record.bundle_path = record.temp_dir / "values.pickle"
+                record.runtime_path = record.temp_dir / "runtime.json"
+                record.status = "running"
+                self._write_record(record)
+            return records
         except BaseException as error:
-            cleaned = self._abort_worker(record)
-            if not cleaned and isinstance(error, Exception):
-                try:
-                    token = self.read_token(record)
-                except BranchError:
-                    token = ""
-                detail = redact_log_text(str(error), self._redaction_tokens(token))
+            # Read worker tokens for redaction before cleanup deletes them.
+            secrets_to_redact = self._redaction_tokens(*self._worker_tokens(records))
+            remaining = [record.worker_id for record in reversed(records) if not self._abort_worker(record)]
+            if not isinstance(error, Exception):
+                raise
+            detail = redact_log_text(str(error), secrets_to_redact)
+            if remaining:
                 raise BranchError(
-                    f"Worker startup failed and cleanup is incomplete; worker {record.worker_id} "
-                    f"remains registered for recovery: {detail}"
+                    f"Worker startup failed and cleanup is incomplete; workers {', '.join(remaining)} "
+                    f"remain registered for recovery: {detail}"
+                ) from error
+            if count > 1:
+                raise BranchError(
+                    f"Starting {count} workers failed at worker {len(records)}; "
+                    f"every started worker was stopped: {detail}"
                 ) from error
             raise
+
+    def _worker_tokens(self, records: Sequence[WorkerRecord]) -> list[str]:
+        tokens = []
+        for record in records:
+            try:
+                tokens.append(self.read_token(record))
+            except BranchError:
+                continue
+        return tokens
 
     def _server_command(self, record: WorkerRecord, runtime: ParentRuntime) -> list[str]:
         port = urllib.parse.urlsplit(record.url).port
@@ -1718,10 +1763,18 @@ def _write_cli_text(stream: Any, text: str) -> None:
     stream.write(data.decode("utf-8"))
 
 
+def _worker_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"--count must be an integer, got {value!r}") from error
+    if not 1 <= count <= MAX_WORKERS_PER_START:
+        raise argparse.ArgumentTypeError(f"--count must be between 1 and {MAX_WORKERS_PER_START}")
+    return count
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Coordinator CLI; the run subcommand accepts only a worker ID and stdin."""
-    import argparse
-
     parser = argparse.ArgumentParser(description="Manage local marimo-pair branch workers")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -1739,6 +1792,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     start.add_argument(
         "--token-file",
         help="file holding the parent token (default: $MARIMO_TOKEN_FILE, then $MARIMO_TOKEN)",
+    )
+    start.add_argument(
+        "--count", type=_worker_count,
+        help=f"start N workers from one export of the parent (1-{MAX_WORKERS_PER_START}); prints a JSON list",
     )
 
     add = subparsers.add_parser("add", help="coordinator-only named export to a worker")
@@ -1770,25 +1827,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             parent = manager.resolve_parent(
                 args.parent_url, notebook=args.parent_notebook, session=args.parent_session,
             )
-            record = manager.start_worker(parent, selected)
-            if record.worker_id in manager._drainers:
-                try:
-                    manager.stop_worker(record.worker_id)
-                except BranchError as cleanup_error:
+            records = manager.start_workers(parent, selected, args.count or 1)
+            if any(record.worker_id in manager._drainers for record in records):
+                cleanup_errors = []
+                for record in reversed(records):
+                    try:
+                        manager.stop_worker(record.worker_id)
+                    except BranchError as cleanup_error:
+                        cleanup_errors.append(f"{record.worker_id}: {cleanup_error}")
+                if cleanup_errors:
                     raise BranchError(
                         "Worker startup requires an SSE drainer that cannot survive this CLI process; "
-                        f"cleanup also failed: {cleanup_error}"
-                    ) from cleanup_error
+                        "cleanup also failed: " + "; ".join(cleanup_errors)
+                    )
                 raise BranchError(
                     "Worker startup requires a process-local SSE drainer; use a persistent coordinator "
                     "instead of the short-lived start CLI"
                 )
-            print(json.dumps({
-                "worker_id": record.worker_id,
-                "url": record.url,
-                "session_id": record.session_id,
-                "status": record.status,
-            }))
+            started = [
+                {
+                    "worker_id": record.worker_id,
+                    "url": record.url,
+                    "session_id": record.session_id,
+                    "status": record.status,
+                    "parent_session": parent.session_id,
+                }
+                for record in records
+            ]
+            print(json.dumps(started if args.count is not None else started[0]))
             return 0
         if args.command == "add":
             manager.add_worker(args.worker, args.parent_session, args.names)

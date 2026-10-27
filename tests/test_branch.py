@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -426,12 +427,12 @@ class WorkerManagerUnitTests(unittest.TestCase):
         worker_id = "f" * 32
         record = mock.Mock(worker_id=worker_id, url="http://127.0.0.1:1234", session_id="worker-session", status="running")
 
-        def initialize(manager):
+        def initialize(manager, *args, **kwargs):
             manager._drainers = {worker_id: (mock.Mock(), mock.Mock(), mock.Mock())}
 
         with mock.patch.object(branch.WorkerManager, "__init__", autospec=True, side_effect=initialize), mock.patch.object(
             branch.WorkerManager, "resolve_parent", return_value=ParentTarget("http://127.0.0.1:4321", "parent", Path("parent.py"))
-        ), mock.patch.object(branch.WorkerManager, "start_worker", return_value=record), mock.patch.object(
+        ), mock.patch.object(branch.WorkerManager, "start_workers", return_value=[record]), mock.patch.object(
             branch.WorkerManager, "stop_worker"
         ) as stop_worker, mock.patch.object(branch.sys, "stderr"):
             result = branch.main([
@@ -1091,6 +1092,154 @@ class ParentResolutionTests(unittest.TestCase):
                 "--names", "records",
             ]), 1)
         resolve.assert_called_once_with("http://localhost:2718", notebook=str(self.a), session=None)
+
+
+def _fake_runtime(notebook: Path, directory: Path) -> dict:
+    return {
+        "notebook_path": str(Path(notebook).resolve()), "config_sources": {}, "cwd": str(directory),
+        "sys_path": [], "python_executable": sys.executable,
+        "python_version": platform.python_version(), "pythonpath": [], "dotenv": [],
+        "sandbox_context": {}, "dependency_context": {
+            "implementation": platform.python_implementation(), "python_prefix": sys.prefix,
+            "base_prefix": sys.base_prefix,
+        },
+    }
+
+
+class StartWorkersTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        self.manager = WorkerManager(root_dir=self.directory / "home", startup_timeout=0.2, request_timeout=0.2)
+        self.notebook = self.directory / "parent.py"
+        self.notebook.write_text("", encoding="utf-8")
+        self.parent = ParentTarget("http://127.0.0.1:1234", "s_parent", self.notebook)
+        self.exports = []
+        self.launches = []
+
+    def _export(self, record, parent, names):
+        self.exports.append(record.worker_id)
+        record.runtime_path.write_text(json.dumps(_fake_runtime(self.notebook, self.directory)), encoding="utf-8")
+        record.bundle_path.write_bytes(b"values")
+
+    def _launch(self, record, runtime):
+        self.launches.append({
+            "worker_id": record.worker_id, "bundle": record.bundle_path,
+            "bundle_exists": record.bundle_path.exists(), "helper_exists": record.helper_path.exists(),
+            "notebook_exists": record.notebook_path.exists(),
+        })
+
+    @contextlib.contextmanager
+    def _patched(self, launch):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {"MARIMO_TOKEN": "parent-secret"}))
+            stack.enter_context(mock.patch.object(
+                self.manager, "_validate_parent", return_value=str(self.notebook.resolve())))
+            stack.enter_context(mock.patch.object(self.manager, "_export_parent", side_effect=self._export))
+            stack.enter_context(mock.patch.object(self.manager, "_launch_and_initialize", side_effect=launch))
+            yield
+
+    def test_one_export_restores_every_worker_then_shared_files_are_removed(self):
+        with self._patched(self._launch):
+            records = self.manager.start_workers(self.parent, ["records"], 3)
+        self.assertEqual(len(self.exports), 1)
+        self.assertEqual(len({record.worker_id for record in records}), 3)
+        self.assertEqual(len({launch["bundle"] for launch in self.launches}), 1)
+        self.assertTrue(all(
+            launch["bundle_exists"] and launch["helper_exists"] and launch["notebook_exists"]
+            for launch in self.launches
+        ))
+        self.assertFalse(self.launches[0]["bundle"].exists())
+        for record in records:
+            self.assertEqual(record.status, "running")
+            # Later `add` batches must use the worker's own private paths.
+            self.assertEqual(record.bundle_path.parent, record.temp_dir)
+            self.assertEqual(record.runtime_path.parent, record.temp_dir)
+            self.assertFalse(record.helper_path.exists())
+            stored = self.manager.get_worker(record.worker_id)
+            self.assertEqual(stored.bundle_path, record.bundle_path)
+            self.assertEqual(stored.status, "running")
+
+    def test_failure_on_a_later_worker_stops_every_earlier_worker(self):
+        def launch(record, runtime):
+            self._launch(record, runtime)
+            if len(self.launches) == 3:
+                raise BranchError("bootstrap failed")
+
+        with self._patched(launch), self.assertRaises(BranchError) as caught:
+            self.manager.start_workers(self.parent, ["records"], 3)
+        self.assertIn("at worker 3", str(caught.exception))
+        self.assertIn("bootstrap failed", str(caught.exception))
+        self.assertEqual(list(self.manager.registry_dir.glob("*.json")), [])
+        self.assertEqual(list(self.manager.temp_root.iterdir()), [])
+
+    def test_incomplete_cleanup_lists_every_remaining_worker(self):
+        def launch(record, runtime):
+            self._launch(record, runtime)
+            if len(self.launches) == 2:
+                raise BranchError("bootstrap failed")
+
+        with self._patched(launch), mock.patch.object(self.manager, "_abort_worker", return_value=False), \
+                self.assertRaises(BranchError) as caught:
+            self.manager.start_workers(self.parent, ["records"], 3)
+        self.assertIn("remain registered", str(caught.exception))
+        for launch_info in self.launches:
+            self.assertIn(launch_info["worker_id"], str(caught.exception))
+
+    def test_interrupt_during_a_later_launch_cleans_everything(self):
+        def launch(record, runtime):
+            self._launch(record, runtime)
+            if len(self.launches) == 2:
+                raise KeyboardInterrupt()
+
+        with self._patched(launch), self.assertRaises(KeyboardInterrupt):
+            self.manager.start_workers(self.parent, ["records"], 2)
+        self.assertEqual(list(self.manager.registry_dir.glob("*.json")), [])
+        self.assertEqual(list(self.manager.temp_root.iterdir()), [])
+
+    def test_count_bounds_are_checked_before_parent_contact(self):
+        with mock.patch.object(self.manager, "_validate_parent") as validate:
+            for count in (0, branch.MAX_WORKERS_PER_START + 1):
+                with self.subTest(count=count), self.assertRaises(BranchError):
+                    self.manager.start_workers(self.parent, ["records"], count)
+        validate.assert_not_called()
+
+    def test_cli_prints_an_object_without_count_and_a_list_with_count(self):
+        records = [
+            mock.Mock(worker_id=str(i) * 32, url=f"http://127.0.0.1:{4000 + i}", session_id=f"w{i}", status="running")
+            for i in range(2)
+        ]
+        parent = ParentTarget("http://127.0.0.1:2718", "s_parent", Path("parent.py"))
+
+        def initialize(manager, *args, **kwargs):
+            manager._drainers = {}
+
+        for argv, count in (([], 1), (["--count", "2"], 2)):
+            stdout = io.StringIO()
+            with self.subTest(argv=argv), mock.patch.object(
+                branch.WorkerManager, "__init__", autospec=True, side_effect=initialize
+            ), mock.patch.object(branch.WorkerManager, "resolve_parent", return_value=parent), mock.patch.object(
+                branch.WorkerManager, "start_workers", side_effect=lambda p, n, c: records[:c]
+            ) as start, mock.patch.object(branch.sys, "stdout", stdout):
+                self.assertEqual(branch.main([
+                    "start", "--parent-url", "http://127.0.0.1:2718", "--names", "records", *argv,
+                ]), 0)
+                start.assert_called_once_with(parent, ["records"], count)
+                printed = json.loads(stdout.getvalue())
+                if argv:
+                    self.assertEqual([item["worker_id"] for item in printed], [r.worker_id for r in records])
+                    self.assertTrue(all(item["parent_session"] == "s_parent" for item in printed))
+                else:
+                    self.assertEqual(printed["worker_id"], records[0].worker_id)
+                    self.assertEqual(printed["parent_session"], "s_parent")
+
+    def test_cli_rejects_out_of_range_counts(self):
+        for value in ("0", "17", "two"):
+            with self.subTest(value=value), mock.patch.object(branch.sys, "stderr", io.StringIO()), \
+                    self.assertRaises(SystemExit):
+                branch.main([
+                    "start", "--parent-url", "http://127.0.0.1:2718", "--names", "records", "--count", value,
+                ])
 
 
 if __name__ == "__main__":
