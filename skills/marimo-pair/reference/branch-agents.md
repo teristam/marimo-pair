@@ -66,7 +66,9 @@ To keep a result for later runs, put it in a named cell:
   clean = df.dropna()
   PY
 Re-running the same --cell name replaces that cell. Each variable can be
-defined by only one cell.
+defined by only one cell. If a new --cell fails, it is removed and keeps
+nothing; if a replaced one fails, re-run it with fixed code. Only printed
+output comes back, so print() what you want to see.
 
 RULES:
 - Do not install packages, write project files, or use any other script, URL,

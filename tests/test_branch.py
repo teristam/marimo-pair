@@ -1346,7 +1346,7 @@ REPO_DOCS = Path(__file__).parents[1] / "skills" / "marimo-pair"
 class PersistentCellTests(unittest.TestCase):
     def test_cell_names_must_be_plain_public_identifiers(self):
         self.assertEqual(branch.validate_cell_name("analysis_1"), "analysis_1")
-        for name in ("", "1x", "has space", "class", "_private", "_bp_bootstrap", "_marimo_pair_x"):
+        for name in ("", "1x", "has space", "class", "_private", "_bp_bootstrap", "_marimo_pair_x", "setup"):
             with self.subTest(name=name), self.assertRaises(BranchError):
                 branch.validate_cell_name(name)
 
@@ -1360,6 +1360,10 @@ class PersistentCellTests(unittest.TestCase):
         self.assertIn("edit_cell(", code)
         self.assertIn("run_cell(", code)
         self.assertIn("hide_code=False", code)
+        # Cells are matched by name, never by ID, and a failed new cell is removed again.
+        self.assertIn("_bp_cell.name == _bp_name", code)
+        self.assertIn("collides with an existing cell ID", code)
+        self.assertIn("delete_cell(_bp_target)", code)
 
     def test_execute_cell_validates_the_name_and_routes_to_one_worker(self):
         manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
@@ -1440,7 +1444,7 @@ def subprocess_run(command, env):
 
 class EnvironmentProbeTests(unittest.TestCase):
     def test_probe_code_reports_python_and_module_versions(self):
-        code = branch._environment_probe_code(["json", "definitely_missing_module_xyz", "unittest.mock"])
+        code = branch._environment_probe_code(["json", "definitely_missing_module_xyz", "unittest"])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             exec(compile(code, "<probe>", "exec"), {})
@@ -1449,7 +1453,7 @@ class EnvironmentProbeTests(unittest.TestCase):
         self.assertEqual(report["python"], platform.python_version())
         self.assertEqual(report["modules"]["json"], "unknown")
         self.assertIsNone(report["modules"]["definitely_missing_module_xyz"])
-        self.assertEqual(report["modules"]["unittest.mock"], "unknown")
+        self.assertEqual(report["modules"]["unittest"], "unknown")
 
     def test_describe_environment_parses_the_worker_report(self):
         manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
@@ -1470,8 +1474,24 @@ class EnvironmentProbeTests(unittest.TestCase):
             report = manager.describe_environment(mock.Mock(worker_id="a" * 32))
         self.assertIn("boom", report["error"])
 
+    def test_describe_environment_reports_validation_errors_instead_of_raising(self):
+        manager = WorkerManager(root_dir=Path(tempfile.mkdtemp()))
+        self.addCleanup(shutil.rmtree, manager.root_dir, True)
+        with mock.patch.object(manager, "_execute_record", side_effect=BranchError("worker went away")):
+            report = manager.describe_environment(mock.Mock(worker_id="a" * 32))
+        self.assertIn("worker went away", report["error"])
+
+    def test_cli_rejects_distribution_names_before_starting_anything(self):
+        with mock.patch.object(branch.WorkerManager, "start_workers") as start, \
+                mock.patch.object(branch.sys, "stderr", io.StringIO()) as stderr, self.assertRaises(SystemExit):
+            branch.main([
+                "start", "--parent-url", "http://127.0.0.1:2718", "--names", "records", "--probe", "scikit-learn",
+            ])
+        start.assert_not_called()
+        self.assertIn("sklearn", stderr.getvalue())
+
     def test_probe_module_names_are_validated(self):
-        for name in ("os; import sys", "", "1abc", "a..b"):
+        for name in ("os; import sys", "", "1abc", "a..b", "torch.cuda", "scikit-learn"):
             with self.subTest(name=name), self.assertRaises(BranchError):
                 branch._environment_probe_code([name])
 
@@ -1481,6 +1501,9 @@ class StartOutputTests(unittest.TestCase):
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, directory, True)
         records = [_record(directory / str(i), worker_id=str(i) * 32) for i in range(2)]
+        for record in records:
+            record.temp_dir.mkdir(parents=True)
+            (record.temp_dir / "run").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
         parent = ParentTarget("http://127.0.0.1:2718", "s_parent", Path("parent.py"))
         environment = {"python": "3.13.1", "modules": {"numpy": "2.1.0"}}
 
@@ -1503,6 +1526,12 @@ class StartOutputTests(unittest.TestCase):
         for item, record in zip(printed, records):
             self.assertEqual(item["environment"], environment)
             self.assertEqual(item["run_command"], ["bash", str(record.temp_dir / "run")])
+
+    def test_run_command_is_null_without_a_launcher(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        manager = WorkerManager(root_dir=directory / "home")
+        self.assertIsNone(manager.run_command(_record(directory)))
 
 
 class CliHelpTests(unittest.TestCase):

@@ -131,13 +131,22 @@ branch agent does not use discovery or direct `execute-code.sh`.
 `run --cell NAME` creates the worker cell `NAME`, or replaces it on later
 calls, and runs it. Its definitions then persist for later runs, which a plain
 scratchpad run does not do. Graph rules apply: another cell cannot redefine
-its names. A cell that errors makes the command exit nonzero.
+its names. The command exits nonzero when the cell or a dependent cell fails.
+A failed *new* cell is deleted again, so none of its definitions are kept; a
+failed *replaced* cell keeps its new code until you re-run it with fixed code.
+Only printed output is returned, not a final expression's value. Names are
+matched against cell names, never cell IDs; `setup` and `_`-prefixed names are
+reserved.
 
 `start` also prints `environment`: the worker's Python version and, for common
 analysis packages, the installed version, `"unknown"` (found but no version
 metadata) or `null` (missing). Workers share the parent's environment, so one
-probe describes all of them. Add modules with `--probe MODULE ...`. A probe
-failure is reported in `environment.error` and does not fail `start`.
+probe describes all of them. Add modules with `--probe MODULE ...`, using
+top-level import names (`sklearn`, not `scikit-learn`); invalid names are
+rejected before any worker starts. A probe failure after startup is reported
+in `environment.error` and does not fail `start`. On Windows, `run_command`
+names the validated Git Bash executable instead of a bare `bash`, and it is
+`null` in `list` for a worker without a launcher.
 
 A branch agent needing more values sends a names-only request to the
 coordinator. The coordinator runs `add`, which finds the parent's **current**

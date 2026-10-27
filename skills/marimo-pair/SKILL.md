@@ -115,9 +115,13 @@ A plain run is a scratchpad: new top-level names are discarded afterwards. To
 keep results between calls, pass `--cell NAME`. It creates the worker cell
 `NAME`, or replaces it on later calls, runs it, and keeps its definitions for
 later runs. marimo's graph rules apply: each name is defined by one cell, so
-redefine a name by re-running the same `--cell NAME`. A failing cell makes the
-command exit nonzero. `branch.py run --worker WORKER_ID [--cell NAME] -` is the
-same operation without the launcher.
+redefine a name by re-running the same `--cell NAME`. If a new cell fails, it
+is removed, so none of its names are kept. If a replaced cell fails, it keeps
+the new code; re-run it with fixed code. A failing dependent cell also makes
+the command exit nonzero. Only printed output comes back, not a final
+expression's value, so `print` results. `setup` and names starting with `_` are
+reserved. `branch.py run --worker WORKER_ID [--cell NAME] -` is the same
+operation without the launcher.
 
 Branch agents follow [branch-agents.md](reference/branch-agents.md), which has
 a prompt template and the rules for combining branching with other skills.

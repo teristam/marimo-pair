@@ -250,35 +250,53 @@ def _without_token_sources(environ: Mapping[str, str]) -> dict[str, str]:
 
 
 def validate_cell_name(name: str) -> str:
-    """Accept a public identifier for a persistent worker cell; reserved prefixes are refused."""
+    """Accept a public identifier for a persistent worker cell; reserved names are refused."""
     if not isinstance(name, str) or not name.isidentifier() or keyword.iskeyword(name):
         raise BranchError(f"Worker cell name must be a Python identifier: {name!r}")
     if name.startswith("_"):
         raise BranchError(f"Worker cell name must not start with '_': {name!r}")
+    if name == "setup":
+        raise BranchError("'setup' is marimo's reserved setup-cell name; choose another worker cell name")
     return name
 
 
 def _persistent_cell_code(cell_name: str, source: str) -> str:
-    """Scratchpad code that creates or replaces one named worker cell, then runs it."""
+    """Scratchpad code that creates or replaces one named worker cell, then runs it.
+
+    A new cell that fails is deleted again, so a failed first attempt leaves
+    nothing behind. An edited cell that fails keeps its new code; the error says
+    so, and re-running the same name replaces it.
+    """
     name = validate_cell_name(cell_name)
     return f'''import marimo._code_mode as cm
 _bp_name = {name!r}
 _bp_source = {source!r}
 async with cm.get_context() as _bp_ctx:
-    if _bp_name in _bp_ctx.cells:
-        # Reading the current code marks this version as seen, so edit_cell is not stale.
-        _bp_ctx.cells[_bp_name].code
-        _bp_ctx.edit_cell(_bp_name, code=_bp_source)
+    _bp_matches = [_bp_cell.id for _bp_cell in _bp_ctx.cells if _bp_cell.name == _bp_name]
+    if not _bp_matches and _bp_name in {{_bp_cell.id for _bp_cell in _bp_ctx.cells}}:
+        raise RuntimeError(f"worker cell name {{_bp_name!r}} collides with an existing cell ID; choose another name")
+    _bp_created = not _bp_matches
+    if _bp_created:
+        _bp_target = _bp_ctx.create_cell(_bp_source, name=_bp_name, hide_code=False)
     else:
-        _bp_ctx.create_cell(_bp_source, name=_bp_name, hide_code=False)
-    _bp_ctx.run_cell(_bp_name)
+        _bp_target = _bp_matches[0]
+        # Reading the current code marks this version as seen, so edit_cell is not stale.
+        _bp_ctx.cells[_bp_target].code
+        _bp_ctx.edit_cell(_bp_target, code=_bp_source)
+    _bp_ctx.run_cell(_bp_target)
 async with cm.get_context() as _bp_ctx:
-    _bp_cell = _bp_ctx.cells[_bp_name]
+    _bp_cell = _bp_ctx.cells[_bp_target]
     _bp_status = str(_bp_cell.status)
     _bp_errors = [str(_bp_error) for _bp_error in (_bp_cell.errors or [])]
 if _bp_errors or _bp_status != "idle":
+    if _bp_created:
+        async with cm.get_context() as _bp_ctx:
+            _bp_ctx.delete_cell(_bp_target)
+        _bp_kept = "the new cell was removed, so none of its definitions were kept"
+    else:
+        _bp_kept = "the cell keeps this new code; re-run --cell with fixed code to replace it"
     raise RuntimeError(
-        f"worker cell {{_bp_name!r}} finished with status {{_bp_status}}: " + "; ".join(_bp_errors)
+        f"worker cell {{_bp_name!r}} finished with status {{_bp_status}} ({{_bp_kept}}): " + "; ".join(_bp_errors)
     )
 '''
 
@@ -288,18 +306,26 @@ DEFAULT_PROBE_MODULES = (
     "numpy", "pandas", "polars", "scipy", "statsmodels", "sklearn",
     "matplotlib", "altair", "plotly", "torch",
 )
-_MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*")
+_MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def validate_probe_module(module: str) -> str:
+    if not isinstance(module, str) or not _MODULE_NAME.fullmatch(module):
+        raise BranchError(
+            f"Invalid module to probe: {module!r}; use a top-level import name such as sklearn, not scikit-learn"
+        )
+    return module
 
 
 def _environment_probe_code(modules: Sequence[str]) -> str:
     """Worker code reporting the Python version and each module's installed version.
 
-    Modules are located with find_spec and never imported, so probing is cheap.
-    A found module without distribution metadata reports "unknown"; a missing one null.
+    Only top-level import names are accepted: find_spec locates them without
+    importing anything, so probing is cheap. A found module without distribution
+    metadata reports "unknown"; a missing one null.
     """
     for module in modules:
-        if not isinstance(module, str) or not _MODULE_NAME.fullmatch(module):
-            raise BranchError(f"Invalid module name to probe: {module!r}")
+        validate_probe_module(module)
     return f'''import importlib.metadata as _bp_metadata
 import importlib.util as _bp_util
 import json as _bp_json
@@ -314,8 +340,7 @@ for _bp_module in {list(modules)!r}:
     _bp_version = None
     if _bp_found:
         _bp_version = "unknown"
-        _bp_top = _bp_module.partition(".")[0]
-        for _bp_dist in _bp_distributions.get(_bp_top, []):
+        for _bp_dist in _bp_distributions.get(_bp_module, []):
             try:
                 _bp_version = _bp_metadata.version(_bp_dist)
                 break
@@ -1718,7 +1743,10 @@ async with cm.get_context() as _bp_cleanup_ctx:
         report carries an "error" entry instead.
         """
         modules = list(dict.fromkeys((*DEFAULT_PROBE_MODULES, *extra_modules)))
-        result = self._execute_record(record, _environment_probe_code(modules), validate=True)
+        try:
+            result = self._execute_record(record, _environment_probe_code(modules), validate=True)
+        except (BranchError, OSError) as error:
+            return {"error": f"environment probe failed: {error}"}
         marker = next(
             (line for line in result.output.splitlines() if line.startswith("MARIMO_PAIR_ENVIRONMENT:")), None,
         )
@@ -1734,10 +1762,20 @@ async with cm.get_context() as _bp_cleanup_ctx:
     def run_capability_path(record: WorkerRecord) -> Path:
         return record.temp_dir / "run"
 
+    def run_command(self, record: WorkerRecord) -> list[str] | None:
+        """The argv handed to a branch agent, or None when the launcher does not exist."""
+        path = self.run_capability_path(record)
+        if not path.is_file():
+            return None
+        # On Windows a bare `bash` may be WSL's launcher; use the validated Git Bash.
+        bash = "bash" if os.name != "nt" else str(self._bash())
+        return [bash, str(path)]
+
     def _write_run_capability(self, record: WorkerRecord) -> None:
         path = self.run_capability_path(record)
         text = build_run_capability(sys.executable, Path(__file__).resolve(), self.root_dir, record.worker_id)
-        _write_private(path, text)
+        # Bytes keep LF line endings on Windows, where Bash rejects CRLF scripts.
+        _write_private(path, text.encode("utf-8"))
         if os.name != "nt":
             path.chmod(0o700)
 
@@ -1925,6 +1963,13 @@ def _write_cli_text(stream: Any, text: str) -> None:
     stream.write(data.decode("utf-8"))
 
 
+def _probe_module(value: str) -> str:
+    try:
+        return validate_probe_module(value)
+    except BranchError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
 def _worker_count(value: str) -> int:
     try:
         count = int(value)
@@ -1967,7 +2012,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"start N workers from one export of the parent (1-{MAX_WORKERS_PER_START}); prints a JSON list",
     )
     start.add_argument(
-        "--probe", nargs="+", default=[], metavar="MODULE",
+        "--probe", nargs="+", default=[], metavar="MODULE", type=_probe_module,
         help="extra modules to report in the output's environment (in addition to common analysis packages)",
     )
 
@@ -2047,7 +2092,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "session_id": record.session_id,
                     "status": record.status,
                     "parent_session": parent.session_id,
-                    "run_command": ["bash", str(manager.run_capability_path(record))],
+                    "run_command": manager.run_command(record),
                     "environment": environment,
                 }
                 for record in records
@@ -2081,7 +2126,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "session_id": record.session_id,
                     "status": record.status,
                     "imported_names": list(record.imported_names),
-                    "run_command": ["bash", str(manager.run_capability_path(record))],
+                    "run_command": manager.run_command(record),
                 }
                 for record in manager.list_workers()
             ]))

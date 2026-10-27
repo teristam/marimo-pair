@@ -596,7 +596,7 @@ class WorkerIntegrationTests(unittest.TestCase):
 
                 first = agent(command, "--cell", "summary", "-", input_text="total = sum(records)\nprint(total)")
                 self.assertEqual(first.returncode, 0, first.stderr[-2000:])
-                self.assertIn("1", first.stdout)
+                self.assertIn("1", first.stdout.splitlines())
                 # Re-running the same cell name replaces it instead of colliding with itself.
                 second = agent(command, "--cell", "summary", "-", input_text="total = sum(records) * 10")
                 self.assertEqual(second.returncode, 0, second.stderr[-2000:])
@@ -606,9 +606,16 @@ class WorkerIntegrationTests(unittest.TestCase):
                 # A second cell redefining the same name is rejected by the graph rules.
                 clash = agent(command, "--cell", "other", "-", input_text="total = 0")
                 self.assertNotEqual(clash.returncode, 0)
-                failing = agent(command, "--cell", "broken", "-", input_text="raise ValueError('nope')")
+                failing = agent(command, "--cell", "broken", "-", input_text="partial = 1\nraise ValueError('nope')")
                 self.assertNotEqual(failing.returncode, 0)
                 self.assertIn("nope", failing.stdout + failing.stderr)
+                self.assertIn("removed", failing.stdout + failing.stderr)
+                # The failed new cell was deleted, so its names are free again.
+                gone = agent(command, "-", input_text="print('partial' in globals())")
+                self.assertIn("False", gone.stdout.splitlines())
+                reused = agent(command, "--cell", "fixed", "-", input_text="partial = 5\nprint(partial)")
+                self.assertEqual(reused.returncode, 0, reused.stderr[-2000:])
+                self.assertIn("5", reused.stdout.splitlines())
                 refused = agent(command, "stop", input_text="")
                 self.assertEqual(refused.returncode, 2)
 
