@@ -1036,6 +1036,8 @@ class WorkerManager:
         # Parent identity is checked before any worker directory/registry is created.
         parent_notebook = self._validate_parent(parent)
         records: list[WorkerRecord] = []
+        # 1-based number of the worker being started; count + 1 once the loop is done.
+        current = 1
         try:
             first = self._new_record(parent, parent_notebook, selected)
             records.append(first)
@@ -1048,6 +1050,7 @@ class WorkerManager:
                 raise BranchError("Parent runtime metadata identifies a different notebook")
             notebook_text = build_worker_notebook(runtime)
             for index in range(count):
+                current = index + 1
                 if index == 0:
                     record = first
                 else:
@@ -1061,6 +1064,7 @@ class WorkerManager:
                     record.helper_path.chmod(0o600)
                 _write_private(record.notebook_path, notebook_text)
                 self._launch_and_initialize(record, runtime)
+            current = count + 1
             # The values and metadata are no longer needed after every bootstrap has run.
             self._remove_path(first.bundle_path)
             self._remove_path(first.runtime_path)
@@ -1085,8 +1089,9 @@ class WorkerManager:
                     f"remain registered for recovery: {detail}"
                 ) from error
             if count > 1:
+                where = f"at worker {current}" if current <= count else f"after launching all {count} workers"
                 raise BranchError(
-                    f"Starting {count} workers failed at worker {len(records)}; "
+                    f"Starting {count} workers failed {where}; "
                     f"every started worker was stopped: {detail}"
                 ) from error
             raise

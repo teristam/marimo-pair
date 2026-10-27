@@ -1173,6 +1173,23 @@ class StartWorkersTests(unittest.TestCase):
         self.assertEqual(list(self.manager.registry_dir.glob("*.json")), [])
         self.assertEqual(list(self.manager.temp_root.iterdir()), [])
 
+    def test_record_creation_failure_names_the_worker_being_started(self):
+        real = self.manager._new_record
+        calls = []
+
+        def new_record(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 2:
+                raise BranchError("no free port")
+            return real(*args, **kwargs)
+
+        with self._patched(self._launch), mock.patch.object(self.manager, "_new_record", side_effect=new_record), \
+                self.assertRaises(BranchError) as caught:
+            self.manager.start_workers(self.parent, ["records"], 3)
+        self.assertIn("at worker 2", str(caught.exception))
+        self.assertEqual(list(self.manager.registry_dir.glob("*.json")), [])
+        self.assertEqual(list(self.manager.temp_root.iterdir()), [])
+
     def test_incomplete_cleanup_lists_every_remaining_worker(self):
         def launch(record, runtime):
             self._launch(record, runtime)
