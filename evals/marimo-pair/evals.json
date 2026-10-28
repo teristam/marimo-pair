@@ -1,0 +1,88 @@
+{
+  "skill_name": "marimo-pair",
+  "notes": "Prompts are templates: {url}, {notebook}, {token_file}, {pair_home} come from `harness.py start` (server.json). Every eval runs against a fresh copy of tests/notebooks/analysis.py on its own token-protected server. Ground truth was computed from analysis.py (seed 0). Expectations marked [state] are graded from `harness.py inspect`; [transcript] from the agent's command log; [answer] from its final reply.",
+  "evals": [
+    {
+      "id": 1,
+      "name": "pair-add-plot-cell",
+      "mode": "pair",
+      "prompt": "I've got my analysis notebook open in marimo at {url} (it's {notebook}, the server token is in {token_file}). Can you add a cell that shows mean reaction time per subject for easy vs hard trials as a seaborn pointplot, and tell me which subject is slowest on hard trials?",
+      "expected_output": "A new, working plot cell added through code mode that reuses the notebook's sns/trials (or summary), and the answer that m03 is slowest on hard trials (~0.394 s vs ~0.389 m01, ~0.388 m02).",
+      "files": ["tests/notebooks/analysis.py"],
+      "expectations": [
+        "[transcript] The first kernel command was the `help(cm)` inspection, before any other code-mode call",
+        "[state] At least one new cell exists and no cell is in an error state",
+        "[state] The notebook file on disk matches the kernel (the .py file was not edited directly)",
+        "[state] None of the original cells were changed",
+        "[state] New cells reuse existing names (sns, trials or summary) and do not re-import seaborn/pandas under an underscore alias",
+        "[answer] Names m03 as the slowest subject on hard trials"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "pair-edit-model-cell",
+      "mode": "pair",
+      "prompt": "in my marimo notebook ({url}, file {notebook}, token file {token_file}) choice_model only uses firing_rate and rt as features. change it so it also uses subject (one-hot) and tell me the training accuracy before vs after",
+      "expected_output": "The model change is made by editing the cell(s) that own features/choice_model (or by adding new non-colliding names), everything downstream (custom_model) still runs, and the reported before-accuracy is ~0.816 with an after-accuracy that matches the kernel.",
+      "files": ["tests/notebooks/analysis.py"],
+      "expectations": [
+        "[transcript] The first kernel command was the `help(cm)` inspection, before any other code-mode call",
+        "[transcript] Read the current code of the cell before calling edit_cell on it",
+        "[state] No cell is in an error state, including custom_model which depends on features",
+        "[state] The notebook file on disk matches the kernel (the .py file was not edited directly)",
+        "[state] choice_model is still defined by exactly one cell and uses a subject encoding",
+        "[answer] Reports the original training accuracy as about 0.816 (0.8158)",
+        "[answer] The reported new accuracy matches choice_model's score in the kernel"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "branch-parallel-explore",
+      "mode": "branch",
+      "prompt": "My marimo notebook {notebook} is running at {url}, token file {token_file}. Preprocessing is slow so I don't want it rerun. Use branch workers (MARIMO_PAIR_HOME={pair_home}) to explore two things in parallel without touching my notebook: (a) KMeans on the per-neuron mean spike counts for k=2..6, reporting silhouette scores; (b) OLS of rt with vs without subject added to the existing condition + firing_rate model, reporting AIC for both. Clean up the workers when done.",
+      "expected_output": "Workers started with branch.py start --names (only the needed values, e.g. spikes / trials), analysis run through each worker's run_command, results reported, workers stopped, parent notebook unchanged.",
+      "files": ["tests/notebooks/analysis.py"],
+      "expectations": [
+        "[transcript] Ran the `help(cm)` inspection against the parent before branch.py start",
+        "[transcript] Started workers with `branch.py start` exporting named values (not by rerunning notebook code)",
+        "[transcript] Exploration code ran through a worker run_command / `branch.py run`, not through execute-code.sh on the parent",
+        "[transcript] The token or token file path was never passed to a branch agent or to a run_command",
+        "[state] The parent notebook has no new or changed cells",
+        "[state] No branch workers are left running",
+        "[answer] Reports silhouette scores for each k in 2..6 and AIC for both OLS models"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "branch-unpicklable-model",
+      "mode": "branch",
+      "prompt": "Notebook {notebook} at {url} (token file {token_file}, MARIMO_PAIR_HOME={pair_home}). Put custom_model, features and session_on_disk into a branch worker and check how custom_model's training accuracy changes if the log transform is dropped. Don't change my notebook.",
+      "expected_output": "Starting a worker with custom_model fails because its pipeline holds the cell-defined function log_rates (a __main__ definition). The agent explains that clearly, does not edit the parent to work around it, recovers by branching only transferable values (features, trials/session_on_disk) and refitting both variants in the worker, reports both accuracies (~0.820 each, i.e. no change), and stops the worker.",
+      "files": ["tests/notebooks/analysis.py"],
+      "expectations": [
+        "[answer] Explains that custom_model cannot be branched because it contains a function defined in a notebook cell (log_rates / __main__)",
+        "[state] The parent notebook has no new or changed cells",
+        "[transcript] Recovered by starting a worker with transferable values only and refitting in the worker",
+        "[answer] Reports accuracy with and without the log transform, both about 0.820 (no meaningful change)",
+        "[state] No branch workers are left running"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "pair-xarray-normalised-psth",
+      "mode": "pair",
+      "prompt": "notebook's live at {url} ({notebook}, token in {token_file}). using session_on_disk, add cells that baseline-normalise the rates (subtract each trial/neuron's mean over the first 5 time bins), average over trials per condition, and plot it as a neuron x time heatmap faceted by condition. keep it as labelled xarray all the way through, no dropping to numpy. then tell me which neuron has the biggest mean hard-minus-easy difference after normalisation",
+      "expected_output": "New cells built with xarray ops (isel/sel, mean over named dims, groupby('condition')) on session_on_disk, a faceted heatmap (e.g. DataArray.plot(col='condition') or equivalent), no errors, and the answer n21 (~8.64 Hz; next n25 ~7.14).",
+      "files": ["tests/notebooks/analysis.py"],
+      "expectations": [
+        "[transcript] The first kernel command was the `help(cm)` inspection, before any other code-mode call",
+        "[state] New cells exist and no cell is in an error state",
+        "[state] The notebook file on disk matches the kernel (the .py file was not edited directly)",
+        "[state] None of the original cells were changed",
+        "[state] New cells use named-dimension xarray operations (mean/sel/isel/groupby with dim names) on session_on_disk and do not convert to numpy with .values/.to_numpy() for the computation",
+        "[state] New cells reuse the notebook's xr/plt imports rather than re-importing under underscore aliases",
+        "[answer] Names n21 as the neuron with the largest hard-minus-easy difference"
+      ]
+    }
+  ]
+}

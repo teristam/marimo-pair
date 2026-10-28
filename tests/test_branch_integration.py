@@ -43,10 +43,14 @@ def _auth_request(url, token, *, session=None, method="GET", data=None, timeout=
 
 
 class ParentServer:
-    def __init__(self, root: Path, notebook: Path, marker: Path):
+    def __init__(self, root: Path, notebook: Path, marker: Path | None, *,
+                 python: str = sys.executable, ready_names: tuple[str, ...] = (),
+                 extra_args: tuple[str, ...] = ()):
+        # Without a marker, readiness means every name in ready_names is a kernel global.
         self.root = root
         self.notebook = notebook
         self.marker = marker
+        self.ready_names = ready_names
         self.port = _port()
         self.url = f"http://127.0.0.1:{self.port}"
         self.token = "parent-test-token-" + os.urandom(8).hex()
@@ -62,14 +66,14 @@ class ParentServer:
         env = os.environ.copy()
         env.update({
             "PYTHONDONTWRITEBYTECODE": "1",
-            "MARIMO_PAIR_MARKER_PATH": str(marker),
+            "MARIMO_PAIR_MARKER_PATH": str(marker or ""),
             "PYTHONPATH": str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", ""),
         })
         command = [
-            sys.executable, "-m", "marimo", "-q", "edit", str(notebook),
+            python, "-m", "marimo", "-q", "edit", str(notebook),
             "--headless", "--host", "127.0.0.1", "--port", str(self.port),
             "--token-password-file", str(self.token_path), "--no-skew-protection",
-            "--no-sandbox", "--skip-update-check",
+            "--no-sandbox", "--skip-update-check", *extra_args,
         ]
         with self.log_path.open("wb") as log:
             self.process = subprocess.Popen(
@@ -105,7 +109,7 @@ class ParentServer:
             method="POST", data=b'{"objectIds": [], "values": [], "autoRun": true}', timeout=10,
         ) as response:
             self.assert_http_ok(response)
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + (30 if self.marker is not None else 180)
         last_status = None
         while time.monotonic() < deadline:
             try:
@@ -115,7 +119,16 @@ class ParentServer:
                     last_status = json.loads(response.read())
             except Exception as error:
                 last_status = {"error": str(error)}
-            if (
+            if self.marker is None and last_status.get("state") == "idle":
+                if not self.code_mode_initialized:
+                    self.sse.close()
+                    self.sse = None
+                    self.execute("import marimo._code_mode as cm; help(cm)")
+                    self.code_mode_initialized = True
+                missing = self.execute(f"print('MISSING:' + ','.join(n for n in {list(self.ready_names)!r} if n not in globals()))")
+                if "MISSING:" in missing.splitlines():
+                    return
+            elif (
                 last_status.get("state") == "idle"
                 and self.marker.exists()
                 and self.marker.read_text(encoding="utf-8").splitlines() == ["started"]
@@ -125,8 +138,8 @@ class ParentServer:
                 self.execute("import marimo._code_mode as cm; help(cm)")
                 self.code_mode_initialized = True
                 return
-            time.sleep(0.1)
-        marker_text = self.marker.read_text(encoding="utf-8") if self.marker.exists() else "<absent>"
+            time.sleep(0.1 if self.marker is not None else 1)
+        marker_text = self.marker.read_text(encoding="utf-8") if self.marker and self.marker.exists() else "<absent>"
         log_text = self.log_path.read_text(encoding="utf-8", errors="replace")
         raise AssertionError(f"Parent did not instantiate to idle exactly once: status={last_status}, marker={marker_text!r}, log={log_text}")
 
@@ -141,7 +154,7 @@ class ParentServer:
         completed = subprocess.run(
             [str(branch.resolve_bash()), str(REPO_ROOT / "skills" / "marimo-pair" / "scripts" / "execute-code.sh"),
              "--url", self.url, "--session", self.session, "-"],
-            input=code, text=True, encoding="utf-8", capture_output=True, timeout=30, env=env, close_fds=True,
+            input=code, text=True, encoding="utf-8", capture_output=True, timeout=120, env=env, close_fds=True,
         )
         if completed.returncode:
             raise AssertionError(completed.stderr or completed.stdout)
