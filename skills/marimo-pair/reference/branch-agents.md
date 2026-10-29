@@ -29,6 +29,13 @@ user which instructions you set aside.
 
 ## Coordinator checklist
 
+The coordinator may also run branches itself, one after another, through each
+worker's `run_command`; the same rule holds that branch code goes only through
+that launcher. Read-only scratchpad checks on the parent (for example reading
+a fitted model's score to verify a worker's rebuild) are fine, since they do
+not change the notebook. `run_command` is printed as a JSON argv list; run it
+as `bash <path> - <<'PY' ... PY`.
+
 1. Run the required parent `help(cm)` inspection.
 2. Run `start --count N --names ...`, with one worker per agent and only the
    names agents need.
