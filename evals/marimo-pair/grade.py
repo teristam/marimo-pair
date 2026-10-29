@@ -69,7 +69,8 @@ def check(expectation: str, state: dict, transcript: str, answer: str) -> tuple[
         return not hits, f"underscore re-imports: {hits}"
     if text.startswith("New cells use named-dimension xarray operations"):
         uses = "session_on_disk" in new_code and re.search(r"\.(mean|isel|sel|groupby)\(", new_code)
-        escapes = NUMPY_ESCAPE.findall(new_code)
+        # Tick labels are presentation, not computation.
+        escapes = [hit for line in new_code.splitlines() if "tick" not in line for hit in NUMPY_ESCAPE.findall(line)]
         return bool(uses) and not escapes, f"xarray ops={bool(uses)} numpy escapes={escapes}"
     if text.startswith("Started workers with `branch.py start`"):
         return bool(re.search(r"branch\.py\s+start[^\n]*--names", transcript)), "branch.py start --names in transcript"

@@ -83,7 +83,7 @@ by `--parent-notebook` path, by an exact `--parent-session` (listing key or
 open sessions; nothing is guessed.
 
 ```bash
-python /absolute/path/to/marimo-pair/scripts/branch.py start \
+python3 /absolute/path/to/marimo-pair/scripts/branch.py start \
   --parent-url http://localhost:2718 --parent-notebook /abs/path/notebook.py \
   --token-file /path/to/token.txt --count 3 --names records latest_model
 ```
@@ -98,7 +98,7 @@ Before this, the coordinator must run and await the required parent `help(cm)`
 command using `execute-code.sh` with explicit `--url` and `--file /abs/path/notebook.py`. The
 worker is only handed off after startup creates and validates its session,
 runs its own first code-mode inspection, and restores all requested names.
-Use `python3` if needed. Supply the parent token with `--token-file` (or `MARIMO_TOKEN_FILE`); do not
+Use `python` instead of `python3` on Windows. Supply the parent token with `--token-file` (or `MARIMO_TOKEN_FILE`); do not
 use an inline environment assignment, which may not match allowed command
 patterns. Never pass the parent token or token file to branch agents. The parent is
 ordinary edit-mode, not globally read-only; keep it idle during export because
@@ -153,15 +153,15 @@ coordinator. The coordinator runs `add`, which finds the parent's **current**
 session for the worker's notebook itself (browser reconnects rename sessions):
 
 ```bash
-python /absolute/path/to/marimo-pair/scripts/branch.py add \
+python3 /absolute/path/to/marimo-pair/scripts/branch.py add \
   --worker WORKER_ID --token-file /path/to/token.txt --names new_value
 ```
 
 Additional coordinator operations:
 
 ```bash
-python /absolute/path/to/marimo-pair/scripts/branch.py list
-python /absolute/path/to/marimo-pair/scripts/branch.py stop --worker WORKER_ID
+python3 /absolute/path/to/marimo-pair/scripts/branch.py list
+python3 /absolute/path/to/marimo-pair/scripts/branch.py stop --worker WORKER_ID
 ```
 
 `add` revalidates the fresh session against the original canonical notebook.

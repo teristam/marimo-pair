@@ -123,16 +123,30 @@ def _unsupported_kind(value: object) -> str | None:
     return None
 
 
+def _describe(value: object) -> str:
+    if isinstance(value, (types.FunctionType, types.BuiltinFunctionType, type)):
+        kind = "class" if isinstance(value, type) else "function"
+        return f"{kind} {value.__module__}.{value.__qualname__}"
+    return f"a {_type_name(value)}"
+
+
 class _ValidatingPickler(pickle.Pickler):
     def __init__(self, stream: Any) -> None:
         super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
         self.current_name = "<batch>"
+        self.current_value: object = None
 
     def persistent_id(self, value: object) -> None:
         reason = _unsupported_kind(value)
         if reason:
+            if value is self.current_value:
+                raise BranchStateError(
+                    self.current_name, _type_name(value), "export", reason
+                )
+            # Name the nested culprit, e.g. a cell-defined function inside a fitted pipeline.
             raise BranchStateError(
-                self.current_name, _type_name(value), "export", reason
+                self.current_name, _type_name(self.current_value), "export",
+                f"it contains {_describe(value)}; {reason}",
             )
         return None
 
@@ -176,6 +190,7 @@ def write_batch(values: Mapping[str, object], path: Path) -> None:
             for current_name in names:
                 current_value = values[current_name]
                 pickler.current_name = current_name
+                pickler.current_value = current_value
                 type_name = _type_name(current_value)
                 try:
                     pickler.dump(current_name)
@@ -314,6 +329,16 @@ def _config_sources(manager: object, notebook: Path) -> dict[str, str]:
     return sources
 
 
+def _project_resolver(notebook_path: Path) -> Any:
+    """marimo's pyproject path resolver (ProjectConfigManager before 0.25.2)."""
+    from marimo._config import manager
+
+    resolver_class = getattr(manager, "PyprojectConfigReader", None) or getattr(
+        manager, "ProjectConfigManager"
+    )
+    return resolver_class(str(notebook_path))
+
+
 def resolve_dotenv_paths(
     paths: Sequence[str], notebook_path: Path
 ) -> tuple[str, ...]:
@@ -326,9 +351,7 @@ def resolve_dotenv_paths(
             for path in values
         )
 
-    from marimo._config.manager import ProjectConfigManager
-
-    resolver = ProjectConfigManager(str(notebook_path))
+    resolver = _project_resolver(notebook_path)
     resolved = resolver._resolve_dotenv({"runtime": {"dotenv": relative}})
     resolved_relative = iter(resolved["runtime"]["dotenv"])
     return tuple(
@@ -348,9 +371,7 @@ def _resolve_pythonpath_paths(
             for path in values
         )
 
-    from marimo._config.manager import ProjectConfigManager
-
-    resolver = ProjectConfigManager(str(notebook_path))
+    resolver = _project_resolver(notebook_path)
     resolved = resolver._resolve_pythonpath({"runtime": {"pythonpath": relative}})
     resolved_relative = iter(resolved["runtime"]["pythonpath"])
     root = resolver._dotenv_root

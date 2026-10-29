@@ -17,7 +17,8 @@ file and notebook conventions:
 - **Results come back as reports, not files.** Each agent ends with a short,
   structured report (the template below). The coordinator writes the synthesis
   into the parent notebook through `cm`, e.g. a markdown summary cell, so the
-  notebook stays the artifact.
+  notebook stays the artifact. If the user asked not to change the notebook,
+  report the synthesis in the reply instead and offer to add it.
 - **Persistent work stays in the worker.** If an agent builds something worth
   keeping, it puts it in named cells with `--cell NAME`. The coordinator can
   read those cells' code, e.g. by asking the agent to print it, and recreate
@@ -36,8 +37,8 @@ user which instructions you set aside.
 4. Hand each agent its own `run_command` and the prompt below. Never hand over
    `branch.py`, the parent token or token file, or another worker's launcher.
 5. Answer names-only requests with `add`.
-6. Collect reports, write the synthesis into the parent, then `stop` every
-   worker.
+6. Collect reports, write the synthesis into the parent (or into the reply
+   when the user asked for no notebook changes), then `stop` every worker.
 
 ## Agent prompt template
 

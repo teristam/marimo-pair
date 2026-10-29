@@ -83,16 +83,20 @@ bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
 no symlink or alternate spelling), unlike `branch.py`'s canonical match.
 
 After it succeeds, start one private worker per branch agent with a single
-export of only the requested names:
+export of only the requested names. Examples use `python3`; on Windows, where
+usually only `python` exists, use that instead:
 
 ```bash
-python /absolute/path/to/marimo-pair/scripts/branch.py start \
+python3 /absolute/path/to/marimo-pair/scripts/branch.py start \
   --parent-url http://localhost:2718 --parent-notebook /abs/path/notebook.py \
   --token-file /path/to/token.txt --count 3 --names records latest_model
 ```
 
 `--count N` (1-16) prints a JSON list of workers sharing one snapshot; startup
-is all-or-nothing. Once started, workers fail independently.
+is all-or-nothing. Once started, workers fail independently. Every worker in a
+`--count` batch receives the same `--names`. When branches need different
+values, either export the union once (one consistent snapshot) or run a
+separate `start` per branch (separate snapshots, taken at different moments).
 
 Each started worker reports:
 - `run_command`: a launcher that can only run code in that one worker
@@ -100,8 +104,7 @@ Each started worker reports:
   common analysis packages, which tells you what branch agents can import
   without installing anything. Add more modules with `--probe MODULE ...`.
 
-Use `python3` instead of `python` where that is the available interpreter. The
-coordinator retains the returned `worker_id` and hands each agent only its
+The coordinator retains the returned `worker_id` and hands each agent only its
 `run_command`. Worker code is sent on stdin, never routed by discovery or an
 arbitrary URL:
 
@@ -110,6 +113,9 @@ bash /tmp/marimo-pair-.../temp/WORKER_ID/run - <<'PY'
 print(records[:3])
 PY
 ```
+
+The launcher sets its own `MARIMO_PAIR_HOME`, so branch agents need no
+registry environment of their own.
 
 A plain run is a scratchpad: new top-level names are discarded afterwards. To
 keep results between calls, pass `--cell NAME`. It creates the worker cell
@@ -130,11 +136,13 @@ The coordinator alone may inspect `branch.py list`, request additional values,
 and stop workers:
 
 ```bash
-python /absolute/path/to/marimo-pair/scripts/branch.py list
-python /absolute/path/to/marimo-pair/scripts/branch.py add \
+python3 /absolute/path/to/marimo-pair/scripts/branch.py list
+python3 /absolute/path/to/marimo-pair/scripts/branch.py add \
   --worker WORKER_ID --token-file /path/to/token.txt --names new_value
-python /absolute/path/to/marimo-pair/scripts/branch.py stop --worker WORKER_ID
+python3 /absolute/path/to/marimo-pair/scripts/branch.py stop --worker WORKER_ID
 ```
+
+A successful `stop` prints nothing; `list` returning `[]` confirms cleanup.
 
 For each later batch, the branch agent sends the coordinator a **names-only**
 request; it must not invoke `add`. The coordinator runs `add`, which resolves
@@ -175,7 +183,16 @@ boundary. V1 requires a
 token-protected, loopback parent and worker on the same host/OS with
 reproducible paths and the parent's Python environment. Unsupported values
 (such as notebook-local classes/functions, UI/state/runtime objects, or
-unpickleable resources) fail with an attributable error. Workers have no
+unpickleable resources) fail with an attributable error that names the
+variable and, when the culprit is nested, what it contains (for example a
+fitted pipeline holding `FunctionTransformer(log_rates)` where `log_rates` is
+defined in a cell). Do not edit the parent to make it transferable unless the
+user agrees. Instead rerun `start` without the failing name (a failed start
+leaves nothing behind) and export the object's inputs. `--names` takes
+variables, not expressions, so export whole upstream variables the user did
+not mention when they hold what you need (e.g. `trials` for the labels). Then
+rebuild the object in a worker `--cell` from the notebook's source and check
+the rebuild against the parent's object (same parameters or scores). Workers have no
 session TTL; stop them explicitly. If `start` is interrupted, use `list` to
 find leftover IDs, then `stop` after the `start` process settles. Do not run
 `stop` concurrently with a worker's in-progress `start`. If `stop` retains
@@ -209,6 +226,10 @@ bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
   --url http://localhost:2718 \
   -c "import marimo._code_mode as cm; help(cm)"
 ```
+
+For a token-protected server, add `--token-file PATH` (the same flag as in
+branching), and add `--file /abs/path/notebook.py` when several notebooks are
+open on that server. Pass both on every later call too.
 
 After that command succeeds, pass task code with `-c CODE`, `-` for stdin, or
 a file path:
@@ -302,7 +323,11 @@ should read `ctx.globals["x"]`, because the scratchpad namespace was copied
 before the cell ran.
 
 Inside the context, queued mutation methods are synchronous. Call them
-directly; do not `await` them. Each call queues an operation for marimo to
+directly; do not `await` them. The exception is `ctx.screenshot(...)`, a
+coroutine even though `help(cm)` may not mark it `async`: without `await` it
+silently does nothing. It needs Playwright with Chromium in the notebook's
+environment; when that is missing, check a figure by saving it from the
+scratchpad instead (`fig.savefig(...)` to a temporary PNG). Each call queues an operation for marimo to
 apply when the context exits normally. If the block raises, the queue is
 discarded.
 
@@ -365,6 +390,10 @@ for cid, impl in ctx.graph.cells.items():
 ctx.graph.descendants(cid)   # cells that re-run when this one changes
 ctx.graph.ancestors(cid)     # cells this one depends on
 ```
+
+`ctx.graph.cells` can omit cells that `ctx.cells` lists, such as a stale cell
+that has not been registered yet. Use `ctx.graph.cells.get(cid)` when
+iterating `ctx.cells`.
 
 In marimo, deletes are *destructive* so it can be useful to query the
 descendants prior to deleting to understand it's impact.

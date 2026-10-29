@@ -112,6 +112,9 @@ class BatchSerializationTests(unittest.TestCase):
                     write_batch({"reduced": ReduceHidingNotebookFunction()}, path)
                 self.assertIn("reduced", str(caught.exception))
                 self.assertIn("__main__", str(caught.exception))
+                # The nested culprit is named, not just reported as builtins.function.
+                self.assertIn("contains function __main__._hidden_notebook_function", str(caught.exception))
+                self.assertIn("ReduceHidingNotebookFunction", str(caught.exception))
                 self.assertFalse(path.exists())
         finally:
             delattr(sys.modules["__main__"], function.__name__)

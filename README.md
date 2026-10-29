@@ -69,7 +69,7 @@ the notebook and the stored one is gone. A `--no-token` parent cannot be used
 for branching.
 
 Replace `/absolute/path/to/marimo-pair` with the installed skill directory
-and use `python3` if `python` is unavailable. Run these commands from the
+and use `python` instead of `python3` on Windows. Run these commands from the
 coordinator, with `PARENT_URL`, `PARENT_NOTEBOOK` (absolute path), and
 `TOKEN_FILE` set to the selected parent:
 
@@ -83,7 +83,7 @@ bash /absolute/path/to/marimo-pair/scripts/execute-code.sh \
 # canonical match.
 
 # Start one worker per branch agent; save the returned worker_id as WORKER_ID.
-python /absolute/path/to/marimo-pair/scripts/branch.py start \
+python3 /absolute/path/to/marimo-pair/scripts/branch.py start \
   --parent-url "$PARENT_URL" --parent-notebook "$PARENT_NOTEBOOK" \
   --token-file "$TOKEN_FILE" --count 3 --names records
 ```
@@ -116,10 +116,10 @@ later batches snapshot the parent's *current* state, and existing worker names
 cannot be replaced:
 
 ```bash
-python /absolute/path/to/marimo-pair/scripts/branch.py add \
+python3 /absolute/path/to/marimo-pair/scripts/branch.py add \
   --worker "$WORKER_ID" --token-file "$TOKEN_FILE" --names latest_model
-python /absolute/path/to/marimo-pair/scripts/branch.py list
-python /absolute/path/to/marimo-pair/scripts/branch.py stop --worker "$WORKER_ID"
+python3 /absolute/path/to/marimo-pair/scripts/branch.py list
+python3 /absolute/path/to/marimo-pair/scripts/branch.py stop --worker "$WORKER_ID"
 ```
 
 Never hand a branch agent the parent token, token file, URL, `add`, direct

@@ -1160,8 +1160,11 @@ class WorkerManager:
         except OSError as error:
             raise BranchError(f"Could not execute the parent exporter: {error}") from error
         if result.returncode != 0 or not record.runtime_path.is_file() or not record.bundle_path.is_file():
-            detail = redact_log_text((result.stderr or result.stdout or "exporter produced no artifacts")[-2000:], [token])
-            raise BranchError(f"Parent value export failed: {detail}")
+            output = result.stderr or result.stdout or "exporter produced no artifacts"
+            # A value that cannot transfer is the user's to fix; its one-line reason beats a kernel traceback.
+            attributable = re.findall(r"BranchStateError: (Cannot [^\n]+)", output)
+            detail = attributable[-1] if attributable else output[-2000:]
+            raise BranchError(f"Parent value export failed: {redact_log_text(detail, [token])}")
 
     def start_worker(self, parent: ParentTarget, names: Sequence[str]) -> WorkerRecord:
         """Snapshot named parent values, then launch and validate an isolated server."""
